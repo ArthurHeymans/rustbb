@@ -26,17 +26,53 @@ pub fn build(
         enabled_features: enabled_features.to_vec(),
         no_default_features,
     };
-    let crate_infos: Vec<CrateInfo> = crate_paths
-        .iter()
-        .map(|p| {
-            let abs_path = if p.is_absolute() {
-                p.clone()
-            } else {
-                std::env::current_dir()?.join(p)
-            };
-            analyze_crate_with_options(&abs_path, &analyze_options)
-        })
-        .collect::<Result<Vec<_>>>()?;
+
+    let mut crate_infos: Vec<CrateInfo> = Vec::new();
+    let mut failed_crates: Vec<(PathBuf, String)> = Vec::new();
+
+    for p in crate_paths {
+        let abs_path = if p.is_absolute() {
+            p.clone()
+        } else {
+            match std::env::current_dir() {
+                Ok(cwd) => cwd.join(p),
+                Err(e) => {
+                    failed_crates.push((p.clone(), e.to_string()));
+                    continue;
+                }
+            }
+        };
+
+        match analyze_crate_with_options(&abs_path, &analyze_options) {
+            Ok(info) => crate_infos.push(info),
+            Err(e) => {
+                let name = p.file_name().and_then(|n| n.to_str()).unwrap_or("unknown");
+                eprintln!("  ⚠ Skipping '{}': {}", name, e);
+                failed_crates.push((p.clone(), e.to_string()));
+            }
+        }
+    }
+
+    // If all crates failed, bail out
+    if crate_infos.is_empty() {
+        if failed_crates.len() == 1 {
+            anyhow::bail!("{}", failed_crates[0].1);
+        } else {
+            anyhow::bail!(
+                "All {} crates failed to analyze. See errors above.",
+                failed_crates.len()
+            );
+        }
+    }
+
+    // If some crates failed but others succeeded, show a summary and continue
+    if !failed_crates.is_empty() {
+        eprintln!(
+            "  ({} of {} crates will be built)",
+            crate_infos.len(),
+            crate_infos.len() + failed_crates.len()
+        );
+    }
 
     // Step 2: Transform each crate
     println!("Transforming {} crates...", crate_infos.len());
