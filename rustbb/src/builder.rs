@@ -7,7 +7,9 @@ use tempfile::TempDir;
 
 use crate::codegen::{generate_combined_crate, GeneratedCrate};
 use crate::discovery::{analyze_crate, run_build_script, CrateInfo, TransformStrategy};
-use crate::transform::{sanitize_name, transform_main, transform_main_with_build_outputs};
+use crate::transform::{
+    sanitize_name, transform_main, transform_main_for_module, transform_main_with_build_outputs,
+};
 
 pub fn build(crate_paths: &[PathBuf], output_name: &str, release: bool) -> Result<()> {
     // Step 1: Analyze all crates
@@ -33,9 +35,18 @@ pub fn build(crate_paths: &[PathBuf], output_name: &str, release: bool) -> Resul
         match &info.strategy {
             TransformStrategy::SimpleMain => {
                 let source = fs::read_to_string(&info.main_path)?;
-                let transformed_source = transform_main(&source, &info.name)?;
+                let transformed_source = if info.has_internal_modules {
+                    transform_main_for_module(&source, &info.name)?
+                } else {
+                    transform_main(&source, &info.name)?
+                };
                 transformed.insert(info.name.clone(), transformed_source);
-                println!("  ✓ {}", info.name);
+                let suffix = if info.has_internal_modules {
+                    " (multi-file)"
+                } else {
+                    ""
+                };
+                println!("  ✓ {}{}", info.name, suffix);
             }
             TransformStrategy::AttributedMain { attrs } => {
                 // Check if it's a supported async runtime
@@ -63,10 +74,28 @@ pub fn build(crate_paths: &[PathBuf], output_name: &str, release: bool) -> Resul
 
                 if is_supported_async || all_harmless {
                     let source = fs::read_to_string(&info.main_path)?;
-                    match transform_main(&source, &info.name) {
+                    let result = if info.has_internal_modules {
+                        transform_main_for_module(&source, &info.name)
+                    } else {
+                        transform_main(&source, &info.name)
+                    };
+                    match result {
                         Ok(transformed_source) => {
                             transformed.insert(info.name.clone(), transformed_source);
-                            let suffix = if is_supported_async { " (async)" } else { "" };
+                            let mut suffix = String::new();
+                            if is_supported_async {
+                                suffix.push_str(" (async");
+                            }
+                            if info.has_internal_modules {
+                                if suffix.is_empty() {
+                                    suffix.push_str(" (multi-file");
+                                } else {
+                                    suffix.push_str(", multi-file");
+                                }
+                            }
+                            if !suffix.is_empty() {
+                                suffix.push(')');
+                            }
                             println!("  ✓ {}{}", info.name, suffix);
                         }
                         Err(e) => {
@@ -240,16 +269,81 @@ fn write_generated_crate(temp_dir: &TempDir, generated: &GeneratedCrate) -> Resu
     // Write main.rs
     fs::write(src_dir.join("main.rs"), &generated.main_rs)?;
 
-    // Write command modules
+    // Write simple command modules (single file)
     for (name, source) in &generated.command_modules {
         let sanitized = sanitize_name(name);
         fs::write(src_dir.join(format!("{}.rs", sanitized)), source)?;
+    }
+
+    // Handle crates with internal modules - copy entire source directory
+    for (sanitized_name, (orig_src_dir, transformed_main)) in &generated.crates_with_modules {
+        let crate_dir = src_dir.join(sanitized_name);
+        fs::create_dir_all(&crate_dir)?;
+
+        // Copy all files from original source directory, transforming crate references
+        copy_source_files_with_transform(orig_src_dir, &crate_dir, sanitized_name)?;
+
+        // Write transformed main as mod.rs
+        fs::write(crate_dir.join("mod.rs"), transformed_main)?;
     }
 
     // Copy .cargo/config.toml if it exists (for linker settings, etc.)
     copy_cargo_config(base)?;
 
     Ok(())
+}
+
+/// Copy source files recursively, transforming crate references
+/// `crate_module_name` is the name of the module (e.g., "lsd") so we can transform
+/// `use crate::X` to `use crate::lsd::X`
+fn copy_source_files_with_transform(src: &Path, dst: &Path, crate_module_name: &str) -> Result<()> {
+    if !src.is_dir() {
+        return Ok(());
+    }
+
+    for entry in fs::read_dir(src)? {
+        let entry = entry?;
+        let src_path = entry.path();
+        let file_name = entry.file_name();
+        let file_name_str = file_name.to_string_lossy();
+
+        // Skip main.rs - we'll use our transformed version
+        if file_name_str == "main.rs" {
+            continue;
+        }
+
+        let dst_path = dst.join(&file_name);
+
+        if src_path.is_dir() {
+            fs::create_dir_all(&dst_path)?;
+            copy_source_files_with_transform(&src_path, &dst_path, crate_module_name)?;
+        } else if file_name_str.ends_with(".rs") {
+            // Transform Rust source files
+            let content = fs::read_to_string(&src_path)?;
+            let transformed = transform_crate_references(&content, crate_module_name);
+            fs::write(&dst_path, transformed)?;
+        } else {
+            // Copy non-Rust files as-is
+            fs::copy(&src_path, &dst_path)?;
+        }
+    }
+
+    Ok(())
+}
+
+/// Transform `use crate::X` to `use crate::{module}::X` in source files
+fn transform_crate_references(source: &str, module_name: &str) -> String {
+    // Replace `use crate::X` with `use crate::{module}::X`
+    // But be careful not to match `use crate;` or `use crate::{module}::` (already transformed)
+    let pattern = regex::Regex::new(&format!(
+        r"\buse\s+crate::(?!{}::)", // Negative lookahead to not match already-transformed
+        regex::escape(module_name)
+    ))
+    .unwrap();
+
+    pattern
+        .replace_all(source, &format!("use crate::{}::", module_name))
+        .to_string()
 }
 
 fn copy_cargo_config(dest_dir: &Path) -> Result<()> {

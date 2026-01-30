@@ -1,5 +1,6 @@
 use anyhow::Result;
 use std::collections::{BTreeMap, HashMap, HashSet};
+use std::path::PathBuf;
 
 use crate::discovery::{CrateInfo, DepInfo};
 use crate::transform::sanitize_name;
@@ -8,7 +9,11 @@ use crate::transform::sanitize_name;
 pub struct GeneratedCrate {
     pub cargo_toml: String,
     pub main_rs: String,
+    /// Simple command modules (single file, no internal modules)
     pub command_modules: HashMap<String, String>,
+    /// Crates that need their entire source directory copied
+    /// Maps sanitized crate name to (src_dir, transformed_main_content)
+    pub crates_with_modules: HashMap<String, (PathBuf, String)>,
 }
 
 pub fn generate_combined_crate(
@@ -23,20 +28,28 @@ pub fn generate_combined_crate(
     // Generate main.rs
     let main_rs = generate_main_rs(crates)?;
 
-    // Collect transformed command modules
-    let command_modules: HashMap<String, String> = crates
-        .iter()
-        .filter_map(|c| {
-            transformed_sources
-                .get(&c.name)
-                .map(|src| (c.name.clone(), src.clone()))
-        })
-        .collect();
+    // Separate crates into simple modules and those with internal modules
+    let mut command_modules: HashMap<String, String> = HashMap::new();
+    let mut crates_with_modules: HashMap<String, (PathBuf, String)> = HashMap::new();
+
+    for c in crates {
+        if let Some(src) = transformed_sources.get(&c.name) {
+            let sanitized = sanitize_name(&c.name);
+            if c.has_internal_modules {
+                // This crate needs its source directory copied
+                crates_with_modules.insert(sanitized, (c.src_dir.clone(), src.clone()));
+            } else {
+                // Simple single-file module
+                command_modules.insert(c.name.clone(), src.clone());
+            }
+        }
+    }
 
     Ok(GeneratedCrate {
         cargo_toml,
         main_rs,
         command_modules,
+        crates_with_modules,
     })
 }
 
@@ -200,6 +213,8 @@ mod tests {
                 has_library: false,
                 version: None,
                 build_script_outputs: BTreeMap::new(),
+                has_internal_modules: false,
+                src_dir: PathBuf::from("/tmp/echo/src"),
             },
             CrateInfo {
                 name: "cat".to_string(),
@@ -210,6 +225,8 @@ mod tests {
                 has_library: false,
                 version: None,
                 build_script_outputs: BTreeMap::new(),
+                has_internal_modules: false,
+                src_dir: PathBuf::from("/tmp/cat/src"),
             },
         ];
 
@@ -243,6 +260,8 @@ mod tests {
                 has_library: false,
                 version: None,
                 build_script_outputs: BTreeMap::new(),
+                has_internal_modules: false,
+                src_dir: PathBuf::from("/tmp/cmd1/src"),
             },
             CrateInfo {
                 name: "cmd2".to_string(),
@@ -264,6 +283,8 @@ mod tests {
                 has_library: false,
                 version: None,
                 build_script_outputs: BTreeMap::new(),
+                has_internal_modules: false,
+                src_dir: PathBuf::from("/tmp/cmd2/src"),
             },
         ];
 

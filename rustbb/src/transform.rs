@@ -9,7 +9,24 @@ use syn::{
 
 /// Transform a crate's main.rs to expose main() as a public function
 pub fn transform_main(source: &str, cmd_name: &str) -> Result<String> {
-    let mut file = parse_file(source).context("Failed to parse source")?;
+    transform_main_internal(source, cmd_name, false)
+}
+
+/// Transform main.rs for crates with internal modules
+/// Changes `use crate::X` to `use self::X` so references work when moved to a subdirectory
+pub fn transform_main_for_module(source: &str, cmd_name: &str) -> Result<String> {
+    transform_main_internal(source, cmd_name, true)
+}
+
+fn transform_main_internal(source: &str, cmd_name: &str, is_submodule: bool) -> Result<String> {
+    // If this will be a submodule, transform `use crate::X` to `use self::X`
+    let source = if is_submodule {
+        transform_crate_to_self(source)
+    } else {
+        source.to_string()
+    };
+
+    let mut file = parse_file(&source).context("Failed to parse source")?;
 
     let mut transformer = MainTransformer {
         cmd_name: cmd_name.to_string(),
@@ -25,6 +42,13 @@ pub fn transform_main(source: &str, cmd_name: &str) -> Result<String> {
     // Generate the transformed source
     let output = quote!(#file);
     Ok(prettyplease::unparse(&syn::parse2(output)?))
+}
+
+/// Transform `use crate::X` to `use self::X` for modules that will be nested
+fn transform_crate_to_self(source: &str) -> String {
+    // Replace `use crate::` with `use self::` but be careful not to match `use crate;`
+    let pattern = regex::Regex::new(r"\buse\s+crate::").unwrap();
+    pattern.replace_all(source, "use self::").to_string()
 }
 
 struct MainTransformer {
