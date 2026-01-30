@@ -42,19 +42,48 @@ pub fn build(crate_paths: &[PathBuf], output_name: &str, release: bool) -> Resul
                     .iter()
                     .any(|a| matches!(a.as_str(), "tokio::main" | "async_std::main"));
 
-                if is_supported_async {
+                // Check if all attributes are "harmless" (don't affect execution)
+                let harmless_attrs = [
+                    "allow",
+                    "warn",
+                    "deny",
+                    "forbid",
+                    "cfg",
+                    "cfg_attr",
+                    "inline",
+                    "cold",
+                    "must_use",
+                    "track_caller",
+                ];
+                let all_harmless = attrs.iter().all(|a| {
+                    harmless_attrs.contains(&a.as_str())
+                        || matches!(a.as_str(), "tokio::main" | "async_std::main")
+                });
+
+                if is_supported_async || all_harmless {
                     let source = fs::read_to_string(&info.main_path)?;
                     match transform_main(&source, &info.name) {
                         Ok(transformed_source) => {
                             transformed.insert(info.name.clone(), transformed_source);
-                            println!("  ✓ {} (async)", info.name);
+                            let suffix = if is_supported_async { " (async)" } else { "" };
+                            println!("  ✓ {}{}", info.name, suffix);
                         }
                         Err(e) => {
                             println!("  ✗ {} - transform failed: {}", info.name, e);
                         }
                     }
                 } else {
-                    println!("  ⚠ {} - unsupported attributes {:?}", info.name, attrs);
+                    let unsupported: Vec<_> = attrs
+                        .iter()
+                        .filter(|a| {
+                            !harmless_attrs.contains(&a.as_str())
+                                && !matches!(a.as_str(), "tokio::main" | "async_std::main")
+                        })
+                        .collect();
+                    println!(
+                        "  ⚠ {} - unsupported attributes {:?}",
+                        info.name, unsupported
+                    );
                 }
             }
             TransformStrategy::Unsupported { reason } => {

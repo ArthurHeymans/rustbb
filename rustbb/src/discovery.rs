@@ -56,29 +56,65 @@ pub fn analyze_crate(path: &Path) -> Result<CrateInfo> {
     let source = fs::read_to_string(&main_path).context("Failed to read main.rs")?;
     let strategy = analyze_main_function(&source)?;
 
-    // Collect dependencies with full info
+    // Collect dependencies with full info, filtering out path-based (workspace) dependencies
     let dependencies: BTreeMap<String, DepInfo> = manifest
         .dependencies
         .iter()
-        .map(|(name, dep)| {
-            let info = match dep {
-                Dependency::Simple(version) => DepInfo {
-                    version: Some(version.clone()),
-                    features: vec![],
-                    optional: false,
-                },
-                Dependency::Detailed(detail) => DepInfo {
-                    version: detail.version.clone(),
-                    features: detail.features.clone(),
-                    optional: detail.optional,
-                },
-                Dependency::Inherited(inherited) => DepInfo {
-                    version: None,
-                    features: inherited.features.clone(),
-                    optional: inherited.optional,
-                },
+        .filter_map(|(name, dep)| {
+            let (actual_name, info) = match dep {
+                Dependency::Simple(version) => (
+                    name.clone(),
+                    Some(DepInfo {
+                        version: Some(version.clone()),
+                        features: vec![],
+                        optional: false,
+                    }),
+                ),
+                Dependency::Detailed(detail) => {
+                    // Skip path-based dependencies (workspace members, local crates)
+                    if detail.path.is_some() {
+                        return None;
+                    }
+                    // Skip git dependencies for now (they need special handling)
+                    if detail.git.is_some() {
+                        return None;
+                    }
+                    // Skip optional dependencies (feature-gated, not needed by default)
+                    if detail.optional {
+                        return None;
+                    }
+                    // Use the actual package name if it's different (renamed dependency)
+                    let actual_name = detail.package.clone().unwrap_or_else(|| name.clone());
+                    (
+                        actual_name,
+                        Some(DepInfo {
+                            version: detail.version.clone(),
+                            features: detail.features.clone(),
+                            optional: detail.optional,
+                        }),
+                    )
+                }
+                Dependency::Inherited(inherited) => {
+                    // Inherited dependencies without version info can't be resolved
+                    // Skip them unless we have workspace context
+                    if inherited.workspace {
+                        return None;
+                    }
+                    // Skip optional dependencies
+                    if inherited.optional {
+                        return None;
+                    }
+                    (
+                        name.clone(),
+                        Some(DepInfo {
+                            version: None,
+                            features: inherited.features.clone(),
+                            optional: inherited.optional,
+                        }),
+                    )
+                }
             };
-            (name.clone(), info)
+            info.map(|i| (actual_name, i))
         })
         .collect();
 
@@ -130,6 +166,13 @@ fn find_main_rs(crate_path: &Path, manifest: &Manifest) -> Result<PathBuf> {
 }
 
 fn analyze_main_function(source: &str) -> Result<TransformStrategy> {
+    // Check for include! macro which indicates build script generated code
+    if source.contains("include!(") && source.contains("OUT_DIR") {
+        return Ok(TransformStrategy::Unsupported {
+            reason: "Uses build script generated code (include! with OUT_DIR)".to_string(),
+        });
+    }
+
     let file = parse_file(source).context("Failed to parse Rust source")?;
 
     for item in &file.items {
