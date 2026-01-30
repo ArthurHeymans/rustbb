@@ -121,9 +121,12 @@ fn transform_clap_parse(call: &ExprCall) -> Option<Expr> {
 fn is_env_args_call(call: &ExprCall) -> bool {
     if let Expr::Path(ExprPath { path, .. }) = &*call.func {
         let segments: Vec<String> = path.segments.iter().map(|s| s.ident.to_string()).collect();
-        // Match std::env::args or env::args
+        // Match std::env::args or env::args or wild::args
         let path_str = segments.join("::");
-        matches!(path_str.as_str(), "std::env::args" | "env::args" | "args")
+        matches!(
+            path_str.as_str(),
+            "std::env::args" | "env::args" | "args" | "wild::args"
+        )
     } else {
         false
     }
@@ -132,11 +135,11 @@ fn is_env_args_call(call: &ExprCall) -> bool {
 fn is_env_args_os_call(call: &ExprCall) -> bool {
     if let Expr::Path(ExprPath { path, .. }) = &*call.func {
         let segments: Vec<String> = path.segments.iter().map(|s| s.ident.to_string()).collect();
-        // Match std::env::args_os or env::args_os
+        // Match std::env::args_os or env::args_os or wild::args_os
         let path_str = segments.join("::");
         matches!(
             path_str.as_str(),
-            "std::env::args_os" | "env::args_os" | "args_os"
+            "std::env::args_os" | "env::args_os" | "args_os" | "wild::args_os"
         )
     } else {
         false

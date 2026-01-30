@@ -1,5 +1,5 @@
 use anyhow::{Context, Result};
-use cargo_toml::{Dependency, Manifest};
+use cargo_toml::{Dependency, DepsSet, Manifest};
 use regex::Regex;
 use std::collections::BTreeMap;
 use std::fs;
@@ -68,67 +68,26 @@ pub fn analyze_crate(path: &Path) -> Result<CrateInfo> {
     let source = fs::read_to_string(&main_path).context("Failed to read main.rs")?;
     let strategy = analyze_main_function(&source)?;
 
-    // Collect dependencies with full info, filtering out path-based (workspace) dependencies
-    let dependencies: BTreeMap<String, DepInfo> = manifest
-        .dependencies
-        .iter()
-        .filter_map(|(name, dep)| {
-            let (actual_name, info) = match dep {
-                Dependency::Simple(version) => (
-                    name.clone(),
-                    Some(DepInfo {
-                        version: Some(version.clone()),
-                        features: vec![],
-                        optional: false,
-                    }),
-                ),
-                Dependency::Detailed(detail) => {
-                    // Skip path-based dependencies (workspace members, local crates)
-                    if detail.path.is_some() {
-                        return None;
-                    }
-                    // Skip git dependencies for now (they need special handling)
-                    if detail.git.is_some() {
-                        return None;
-                    }
-                    // Skip optional dependencies (feature-gated, not needed by default)
-                    if detail.optional {
-                        return None;
-                    }
-                    // Use the actual package name if it's different (renamed dependency)
-                    let actual_name = detail.package.clone().unwrap_or_else(|| name.clone());
-                    (
-                        actual_name,
-                        Some(DepInfo {
-                            version: detail.version.clone(),
-                            features: detail.features.clone(),
-                            optional: detail.optional,
-                        }),
-                    )
-                }
-                Dependency::Inherited(inherited) => {
-                    // Inherited dependencies without version info can't be resolved
-                    // Skip them unless we have workspace context
-                    if inherited.workspace {
-                        return None;
-                    }
-                    // Skip optional dependencies
-                    if inherited.optional {
-                        return None;
-                    }
-                    (
-                        name.clone(),
-                        Some(DepInfo {
-                            version: None,
-                            features: inherited.features.clone(),
-                            optional: inherited.optional,
-                        }),
-                    )
-                }
-            };
-            info.map(|i| (actual_name, i))
-        })
-        .collect();
+    // Get default features to know which optional deps are enabled
+    let default_features: Vec<String> = manifest
+        .features
+        .get("default")
+        .cloned()
+        .unwrap_or_default();
+
+    // Collect regular dependencies
+    let mut dependencies = collect_deps_from_set(&manifest.dependencies, true, &default_features);
+
+    // Collect target-specific dependencies that apply to the current platform
+    for (target_cfg, target) in &manifest.target {
+        if cfg_matches_current_platform(target_cfg) {
+            let target_deps = collect_deps_from_set(&target.dependencies, true, &default_features);
+            // Merge target deps into main deps
+            for (name, info) in target_deps {
+                dependencies.entry(name).or_insert(info);
+            }
+        }
+    }
 
     // Check if this crate has a library component
     let has_library = path.join("src/lib.rs").exists() || manifest.lib.is_some();
@@ -166,6 +125,223 @@ fn has_mod_declarations(source: &str) -> bool {
     // These indicate the crate has separate .rs files that need to be copied
     let mod_pattern = Regex::new(r"(?m)^mod\s+[a-zA-Z_][a-zA-Z0-9_]*\s*;").unwrap();
     mod_pattern.is_match(source)
+}
+
+/// Evaluate if a cfg expression applies to the current platform
+/// Handles common patterns like cfg(unix), cfg(windows), cfg(target_os = "linux"), etc.
+fn cfg_matches_current_platform(cfg_str: &str) -> bool {
+    let cfg_lower = cfg_str.to_lowercase();
+
+    // Parse out the cfg expression
+    // Handle both `cfg(...)` and `'cfg(...)'` formats
+    let cfg_content = if let Some(inner) = cfg_str
+        .trim()
+        .strip_prefix("cfg(")
+        .and_then(|s| s.strip_suffix(')'))
+    {
+        inner
+    } else if let Some(inner) = cfg_str
+        .trim()
+        .strip_prefix("'cfg(")
+        .and_then(|s| s.strip_suffix(")'"))
+    {
+        inner
+    } else {
+        // Not a cfg expression we understand - include it to be safe
+        return true;
+    };
+
+    // Evaluate simple cfg expressions
+    eval_cfg_expr(cfg_content.trim())
+}
+
+/// Evaluate a cfg expression (the inner part, without cfg(...))
+fn eval_cfg_expr(expr: &str) -> bool {
+    let expr_lower = expr.to_lowercase();
+
+    // Handle `not(...)`
+    if let Some(inner) = expr.strip_prefix("not(").and_then(|s| s.strip_suffix(')')) {
+        return !eval_cfg_expr(inner.trim());
+    }
+
+    // Handle `all(...)`
+    if let Some(inner) = expr.strip_prefix("all(").and_then(|s| s.strip_suffix(')')) {
+        // Split by commas (simplified - doesn't handle nested parens well)
+        return split_cfg_args(inner)
+            .iter()
+            .all(|arg| eval_cfg_expr(arg.trim()));
+    }
+
+    // Handle `any(...)`
+    if let Some(inner) = expr.strip_prefix("any(").and_then(|s| s.strip_suffix(')')) {
+        return split_cfg_args(inner)
+            .iter()
+            .any(|arg| eval_cfg_expr(arg.trim()));
+    }
+
+    // Simple predicates
+    match expr_lower.as_str() {
+        "unix" => cfg!(unix),
+        "windows" => cfg!(windows),
+        "target_family = \"unix\"" => cfg!(unix),
+        "target_family = \"windows\"" => cfg!(windows),
+        _ => {
+            // Handle target_os = "..."
+            if expr_lower.contains("target_os") {
+                if expr_lower.contains("linux") {
+                    return cfg!(target_os = "linux");
+                }
+                if expr_lower.contains("macos") || expr_lower.contains("darwin") {
+                    return cfg!(target_os = "macos");
+                }
+                if expr_lower.contains("windows") {
+                    return cfg!(target_os = "windows");
+                }
+                if expr_lower.contains("freebsd") {
+                    return cfg!(target_os = "freebsd");
+                }
+            }
+
+            // Handle target_arch = "..."
+            if expr_lower.contains("target_arch") {
+                if expr_lower.contains("x86_64") {
+                    return cfg!(target_arch = "x86_64");
+                }
+                if expr_lower.contains("x86") && !expr_lower.contains("x86_64") {
+                    return cfg!(target_arch = "x86");
+                }
+                if expr_lower.contains("aarch64") {
+                    return cfg!(target_arch = "aarch64");
+                }
+                if expr_lower.contains("arm") {
+                    return cfg!(target_arch = "arm");
+                }
+            }
+
+            // Handle target_env = "..."
+            if expr_lower.contains("target_env") {
+                if expr_lower.contains("gnu") {
+                    return cfg!(target_env = "gnu");
+                }
+                if expr_lower.contains("msvc") {
+                    return cfg!(target_env = "msvc");
+                }
+                if expr_lower.contains("musl") {
+                    return cfg!(target_env = "musl");
+                }
+            }
+
+            // Unknown predicate - include it to be safe
+            true
+        }
+    }
+}
+
+/// Split cfg arguments by comma, respecting parentheses nesting
+fn split_cfg_args(s: &str) -> Vec<&str> {
+    let mut args = Vec::new();
+    let mut depth = 0;
+    let mut start = 0;
+
+    for (i, c) in s.char_indices() {
+        match c {
+            '(' => depth += 1,
+            ')' => depth -= 1,
+            ',' if depth == 0 => {
+                args.push(&s[start..i]);
+                start = i + 1;
+            }
+            _ => {}
+        }
+    }
+
+    if start < s.len() {
+        args.push(&s[start..]);
+    }
+
+    args
+}
+
+/// Collect dependencies from a DepsSet, filtering appropriately
+fn collect_deps_from_set(
+    deps: &DepsSet,
+    filter_optional: bool,
+    default_features: &[String],
+) -> BTreeMap<String, DepInfo> {
+    deps.iter()
+        .filter_map(|(name, dep)| {
+            let (actual_name, info) = match dep {
+                Dependency::Simple(version) => (
+                    name.clone(),
+                    Some(DepInfo {
+                        version: Some(version.clone()),
+                        features: vec![],
+                        optional: false,
+                    }),
+                ),
+                Dependency::Detailed(detail) => {
+                    // Skip path-based dependencies (workspace members, local crates)
+                    if detail.path.is_some() {
+                        return None;
+                    }
+                    // Skip git dependencies for now (they need special handling)
+                    if detail.git.is_some() {
+                        return None;
+                    }
+                    // Handle optional dependencies
+                    if detail.optional && filter_optional {
+                        // Check if this optional dep is enabled by default features
+                        // Default features can reference deps directly or via dep:name syntax
+                        let dep_enabled = default_features.iter().any(|f| {
+                            f == name
+                                || f == &format!("dep:{}", name)
+                                || f.starts_with(&format!("{}/", name))
+                        });
+                        if !dep_enabled {
+                            return None;
+                        }
+                    }
+                    // Use the actual package name if it's different (renamed dependency)
+                    let actual_name = detail.package.clone().unwrap_or_else(|| name.clone());
+                    (
+                        actual_name,
+                        Some(DepInfo {
+                            version: detail.version.clone(),
+                            features: detail.features.clone(),
+                            optional: detail.optional,
+                        }),
+                    )
+                }
+                Dependency::Inherited(inherited) => {
+                    // Inherited dependencies without version info can't be resolved
+                    // Skip them unless we have workspace context
+                    if inherited.workspace {
+                        return None;
+                    }
+                    // Handle optional dependencies
+                    if inherited.optional && filter_optional {
+                        let dep_enabled = default_features.iter().any(|f| {
+                            f == name
+                                || f == &format!("dep:{}", name)
+                                || f.starts_with(&format!("{}/", name))
+                        });
+                        if !dep_enabled {
+                            return None;
+                        }
+                    }
+                    (
+                        name.clone(),
+                        Some(DepInfo {
+                            version: None,
+                            features: inherited.features.clone(),
+                            optional: inherited.optional,
+                        }),
+                    )
+                }
+            };
+            info.map(|i| (actual_name, i))
+        })
+        .collect()
 }
 
 fn find_main_rs(crate_path: &Path, manifest: &Manifest) -> Result<PathBuf> {
