@@ -4,12 +4,14 @@
 
 ## Features
 
+- **Fetch from anywhere** - Combine crates from local paths, crates.io, or git repositories
+- **Like `cargo install`** - Just specify crate names and rustbb fetches them automatically
 - **Combine existing CLI crates** - Transform unmodified Rust CLI programs into a single binary
 - **Symlink and subcommand modes** - Invoke commands via symlinks (`./cat file`) or subcommands (`./busybox cat file`)
 - **Automatic argument handling** - Transforms `std::env::args()` and `clap::Parser::parse()` calls
 - **Async runtime support** - Handles `#[tokio::main]` and `#[async_std::main]` automatically
 - **Dependency merging** - Combines dependencies with proper version and feature handling
-- **Size optimization** - Release builds with LTO produce compact binaries (552KB for 4 commands with clap)
+- **Size optimization** - Release builds with LTO produce compact binaries
 
 ## Quick Start
 
@@ -17,17 +19,36 @@
 # Build rustbb
 cargo build -p rustbb --release
 
-# Analyze a crate (shows transformation strategy)
-./target/release/rustbb analyze path/to/mycli
+# Build from crates.io (like cargo install, but combined!)
+./target/release/rustbb build hexyl bat -o tools --release
 
-# Build a multi-call binary
-./target/release/rustbb build path/to/cli1 path/to/cli2 -o mybox --release
+# Build from GitHub
+./target/release/rustbb build github:sharkdp/fd github:sharkdp/hexyl -o finder --release
+
+# Build from local paths
+./target/release/rustbb build ./my-cli ./other-cli -o mybox --release
+
+# Mix sources
+./target/release/rustbb build ./local-tool hexyl github:user/repo -o mixed --release
 
 # Use the combined binary
-./mybox cli1 arg1 arg2       # Subcommand mode
-ln -s mybox cli1 && ./cli1   # Symlink mode
-./mybox --list               # List available commands
+./tools hexyl file.bin       # Subcommand mode
+ln -s tools hexyl && ./hexyl # Symlink mode
+./tools --list               # List available commands
 ```
+
+## Crate Sources
+
+rustbb supports multiple ways to specify crates:
+
+| Format | Description | Example |
+|--------|-------------|---------|
+| `./path` | Local filesystem path | `./my-cli` |
+| `crate_name` | Latest version from crates.io | `hexyl` |
+| `crate@version` | Specific version from crates.io | `hexyl@0.14` |
+| `github:user/repo` | GitHub repository (main branch) | `github:sharkdp/bat` |
+| `github:user/repo#ref` | GitHub repository at tag/branch | `github:sharkdp/bat#v0.24.0` |
+| `git:url` | Any git repository | `git:https://gitlab.com/user/repo.git` |
 
 ## How It Works
 

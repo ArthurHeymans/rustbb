@@ -12,6 +12,10 @@ pub struct CrateInfo {
     pub main_path: PathBuf,
     pub strategy: TransformStrategy,
     pub dependencies: BTreeMap<String, DepInfo>,
+    /// If true, this crate has a library (lib.rs) that the binary may depend on
+    pub has_library: bool,
+    /// Version of the crate (for adding as dependency)
+    pub version: Option<String>,
 }
 
 #[derive(Debug, Clone)]
@@ -46,7 +50,7 @@ pub fn analyze_crate(path: &Path) -> Result<CrateInfo> {
         .unwrap_or_else(|| "unknown".to_string());
 
     // Find main.rs
-    let main_path = find_main_rs(path)?;
+    let main_path = find_main_rs(path, &manifest)?;
 
     // Analyze main() function
     let source = fs::read_to_string(&main_path).context("Failed to read main.rs")?;
@@ -78,16 +82,39 @@ pub fn analyze_crate(path: &Path) -> Result<CrateInfo> {
         })
         .collect();
 
+    // Check if this crate has a library component
+    let has_library = path.join("src/lib.rs").exists() || manifest.lib.is_some();
+
+    // Get version from manifest
+    let version = manifest
+        .package
+        .as_ref()
+        .and_then(|p| p.version.get().ok())
+        .map(|v| v.to_string());
+
     Ok(CrateInfo {
         name,
         path: path.to_path_buf(),
         main_path,
         strategy,
         dependencies,
+        has_library,
+        version,
     })
 }
 
-fn find_main_rs(crate_path: &Path) -> Result<PathBuf> {
+fn find_main_rs(crate_path: &Path, manifest: &Manifest) -> Result<PathBuf> {
+    // First check if there's a [[bin]] entry with an explicit path
+    for bin in &manifest.bin {
+        if let Some(path) = &bin.path {
+            let bin_path = crate_path.join(path);
+            if bin_path.exists() {
+                return Ok(bin_path);
+            }
+        }
+    }
+
+    // Default candidates
     let candidates = [
         crate_path.join("src/main.rs"),
         crate_path.join("src/bin/main.rs"),

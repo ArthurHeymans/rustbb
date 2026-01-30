@@ -85,6 +85,19 @@ fn merge_dependencies(crates: &[CrateInfo]) -> BTreeMap<String, DepInfo> {
     let mut merged: BTreeMap<String, DepInfo> = BTreeMap::new();
 
     for crate_info in crates {
+        // If this crate has a library, add the crate itself as a dependency
+        // so that `use cratename::...` imports work
+        if crate_info.has_library {
+            merged.insert(
+                crate_info.name.clone(),
+                DepInfo {
+                    version: crate_info.version.clone(),
+                    features: vec![],
+                    optional: false,
+                },
+            );
+        }
+
         for (name, info) in &crate_info.dependencies {
             if let Some(existing) = merged.get_mut(name) {
                 // Merge features
@@ -184,6 +197,8 @@ mod tests {
                 main_path: PathBuf::from("/tmp/echo/src/main.rs"),
                 strategy: TransformStrategy::SimpleMain,
                 dependencies: BTreeMap::new(),
+                has_library: false,
+                version: None,
             },
             CrateInfo {
                 name: "cat".to_string(),
@@ -191,6 +206,8 @@ mod tests {
                 main_path: PathBuf::from("/tmp/cat/src/main.rs"),
                 strategy: TransformStrategy::SimpleMain,
                 dependencies: BTreeMap::new(),
+                has_library: false,
+                version: None,
             },
         ];
 
@@ -221,6 +238,8 @@ mod tests {
                     );
                     deps
                 },
+                has_library: false,
+                version: None,
             },
             CrateInfo {
                 name: "cmd2".to_string(),
@@ -239,6 +258,8 @@ mod tests {
                     );
                     deps
                 },
+                has_library: false,
+                version: None,
             },
         ];
 
