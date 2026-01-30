@@ -153,6 +153,10 @@ impl MainTransformer {
         // Check for async runtime attributes
         let async_runtime = detect_async_runtime(func);
 
+        // Get the original return type for use in closures
+        let original_return_type = &func.sig.output;
+        let returns_result = returns_result_type(original_return_type);
+
         // Remove runtime attributes (we'll handle the runtime ourselves)
         func.attrs.retain(|attr| {
             let path_str = attr
@@ -182,33 +186,87 @@ impl MainTransformer {
                 // Remove async from signature
                 func.sig.asyncness = None;
                 // Wrap in tokio runtime
-                func.block = parse_quote!({
-                    tokio::runtime::Runtime::new()
-                        .expect("Failed to create Tokio runtime")
-                        .block_on(async #original_block);
-                    0i32
-                });
+                if returns_result {
+                    func.block = parse_quote!({
+                        match tokio::runtime::Runtime::new()
+                            .expect("Failed to create Tokio runtime")
+                            .block_on(async #original_block)
+                        {
+                            Ok(_) => 0i32,
+                            Err(e) => {
+                                eprintln!("Error: {e:?}");
+                                1i32
+                            }
+                        }
+                    });
+                } else {
+                    func.block = parse_quote!({
+                        tokio::runtime::Runtime::new()
+                            .expect("Failed to create Tokio runtime")
+                            .block_on(async #original_block);
+                        0i32
+                    });
+                }
             }
             Some(AsyncRuntime::AsyncStd) => {
                 // Remove async from signature
                 func.sig.asyncness = None;
                 // Wrap in async_std runtime
-                func.block = parse_quote!({
-                    async_std::task::block_on(async #original_block);
-                    0i32
-                });
+                if returns_result {
+                    func.block = parse_quote!({
+                        match async_std::task::block_on(async #original_block) {
+                            Ok(_) => 0i32,
+                            Err(e) => {
+                                eprintln!("Error: {e:?}");
+                                1i32
+                            }
+                        }
+                    });
+                } else {
+                    func.block = parse_quote!({
+                        async_std::task::block_on(async #original_block);
+                        0i32
+                    });
+                }
             }
             None => {
-                // Sync function - simple wrap
-                func.block = parse_quote!({
-                    (|| #original_block)();
-                    0i32
-                });
+                // Sync function - wrap appropriately based on return type
+                if returns_result {
+                    // Use the original return type for the closure to avoid type inference issues
+                    func.block = parse_quote!({
+                        match (|| #original_return_type #original_block)() {
+                            Ok(_) => 0i32,
+                            Err(e) => {
+                                eprintln!("Error: {e:?}");
+                                1i32
+                            }
+                        }
+                    });
+                } else {
+                    func.block = parse_quote!({
+                        (|| #original_block)();
+                        0i32
+                    });
+                }
             }
         }
 
         // Update signature to return i32
         func.sig.output = parse_quote!(-> i32);
+    }
+}
+
+/// Check if a return type is a Result (or similar fallible type)
+fn returns_result_type(output: &syn::ReturnType) -> bool {
+    match output {
+        syn::ReturnType::Default => false,
+        syn::ReturnType::Type(_, ty) => {
+            // Convert type to string and check for Result patterns
+            let type_str = quote!(#ty).to_string();
+            type_str.contains("Result")
+                || type_str.contains("anyhow :: Result")
+                || type_str.contains("io :: Result")
+        }
     }
 }
 

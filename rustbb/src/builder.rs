@@ -25,6 +25,7 @@ pub fn build(
     let analyze_options = AnalyzeOptions {
         enabled_features: enabled_features.to_vec(),
         no_default_features,
+        workspace_context: None,
     };
 
     let mut crate_infos: Vec<CrateInfo> = Vec::new();
@@ -362,9 +363,271 @@ fn write_generated_crate(temp_dir: &TempDir, generated: &GeneratedCrate) -> Resu
         fs::write(crate_dir.join("mod.rs"), transformed_mod)?;
     }
 
+    // Copy path dependencies (workspace members) to deps/ directory
+    if !generated.path_dependencies.is_empty() {
+        let deps_dir = base.join("deps");
+        fs::create_dir_all(&deps_dir)?;
+
+        // Find the workspace root (common ancestor of all path dependencies)
+        let workspace_root = find_workspace_root_from_deps(&generated.path_dependencies);
+
+        // Copy workspace root resource files (like languages.toml, runtime/, etc.)
+        // These go into deps/ so that relative paths like `include_bytes!("../../languages.toml")`
+        // from deps/helix-loader/src/config.rs resolve correctly to deps/languages.toml
+        if let Some(ref ws_root) = workspace_root {
+            copy_workspace_resources(ws_root, &deps_dir)?;
+        }
+
+        // Collect all package names for patching
+        let all_pkg_names: std::collections::BTreeMap<String, PathBuf> = generated
+            .path_dependencies
+            .iter()
+            .map(|(name, info)| (name.clone(), info.path.clone()))
+            .collect();
+
+        for (pkg_name, dep_info) in &generated.path_dependencies {
+            let dest_dir = deps_dir.join(pkg_name);
+            copy_dir_all(&dep_info.path, &dest_dir)?;
+
+            // Patch the Cargo.toml to remove workspace inheritance
+            let cargo_toml_path = dest_dir.join("Cargo.toml");
+            if cargo_toml_path.exists() {
+                patch_workspace_cargo_toml(&cargo_toml_path, &all_pkg_names)?;
+            }
+        }
+    }
+
     // Copy .cargo/config.toml if it exists (for linker settings, etc.)
     copy_cargo_config(base)?;
 
+    Ok(())
+}
+
+/// Find the workspace root (common parent directory of all path dependencies)
+fn find_workspace_root(
+    path_deps: &std::collections::BTreeMap<String, crate::codegen::GeneratedCrate>,
+) -> Option<PathBuf> {
+    // This is a simplified implementation - we'll use it with the actual type later
+    None
+}
+
+/// Find the workspace root from path dependencies
+fn find_workspace_root_from_deps(
+    path_deps: &std::collections::BTreeMap<String, crate::discovery::PathDepInfo>,
+) -> Option<PathBuf> {
+    if path_deps.is_empty() {
+        return None;
+    }
+
+    // Get all the dep paths
+    let paths: Vec<&PathBuf> = path_deps.values().map(|d| &d.path).collect();
+    if paths.is_empty() {
+        return None;
+    }
+
+    // Find common ancestor
+    let mut common = paths[0].clone();
+    for path in &paths[1..] {
+        while !path.starts_with(&common) {
+            if let Some(parent) = common.parent() {
+                common = parent.to_path_buf();
+            } else {
+                return None;
+            }
+        }
+    }
+
+    // Verify this looks like a workspace root (has a Cargo.toml with [workspace])
+    let cargo_toml = common.join("Cargo.toml");
+    if cargo_toml.exists() {
+        if let Ok(content) = fs::read_to_string(&cargo_toml) {
+            if content.contains("[workspace]") {
+                return Some(common);
+            }
+        }
+    }
+
+    None
+}
+
+/// Copy workspace resource files to the generated crate directory
+fn copy_workspace_resources(workspace_root: &Path, dest: &Path) -> Result<()> {
+    // Copy .toml files from root (like languages.toml)
+    if let Ok(entries) = fs::read_dir(workspace_root) {
+        for entry in entries.flatten() {
+            let path = entry.path();
+            let name = entry.file_name();
+            let name_str = name.to_string_lossy();
+
+            // Copy .toml files (like languages.toml)
+            if path.is_file() && name_str.ends_with(".toml") && name_str != "Cargo.toml" {
+                // Ignore errors for individual files
+                let _ = fs::copy(&path, dest.join(&name));
+            }
+
+            // Copy runtime directory if it exists (but don't fail if it can't be copied)
+            if path.is_dir() && name_str == "runtime" {
+                let _ = copy_dir_all_lenient(&path, &dest.join("runtime"));
+            }
+
+            // Copy contrib directory if it exists
+            if path.is_dir() && name_str == "contrib" {
+                let _ = copy_dir_all_lenient(&path, &dest.join("contrib"));
+            }
+        }
+    }
+    Ok(())
+}
+
+/// Recursively copy a directory, ignoring errors for individual files
+fn copy_dir_all_lenient(src: &Path, dst: &Path) -> Result<()> {
+    fs::create_dir_all(dst)?;
+    if let Ok(entries) = fs::read_dir(src) {
+        for entry in entries.flatten() {
+            let ty = match entry.file_type() {
+                Ok(t) => t,
+                Err(_) => continue,
+            };
+            let src_path = entry.path();
+            let dst_path = dst.join(entry.file_name());
+
+            if ty.is_dir() {
+                let name = entry.file_name();
+                // Skip target directories, .git, sources
+                if name == "target" || name == ".git" || name == "sources" {
+                    continue;
+                }
+                let _ = copy_dir_all_lenient(&src_path, &dst_path);
+            } else if ty.is_file() {
+                let _ = fs::copy(&src_path, &dst_path);
+            }
+            // Skip symlinks and other types
+        }
+    }
+    Ok(())
+}
+
+/// Recursively copy a directory
+fn copy_dir_all(src: &Path, dst: &Path) -> Result<()> {
+    fs::create_dir_all(dst)?;
+    for entry in fs::read_dir(src)? {
+        let entry = entry?;
+        let ty = entry.file_type()?;
+        let src_path = entry.path();
+        let dst_path = dst.join(entry.file_name());
+
+        if ty.is_dir() {
+            // Skip target directories and .git
+            let name = entry.file_name();
+            if name == "target" || name == ".git" {
+                continue;
+            }
+            copy_dir_all(&src_path, &dst_path)?;
+        } else {
+            fs::copy(&src_path, &dst_path)?;
+        }
+    }
+    Ok(())
+}
+
+/// Patch a workspace member's Cargo.toml to remove workspace inheritance
+/// and convert path dependencies to use the deps/ directory
+fn patch_workspace_cargo_toml(
+    cargo_toml_path: &Path,
+    all_path_deps: &std::collections::BTreeMap<String, PathBuf>,
+) -> Result<()> {
+    let content = fs::read_to_string(cargo_toml_path)?;
+
+    // Use regex to patch the content
+    let mut patched = content.clone();
+
+    // First, remove workspace-inherited package fields that aren't critical
+    // (Do this BEFORE replacing version, since rust-version contains "version")
+    let remove_fields = [
+        "authors",
+        "license",
+        "rust-version",
+        "categories",
+        "repository",
+        "homepage",
+        "keywords",
+        "readme",
+        "documentation",
+    ];
+    for field in remove_fields {
+        let re = regex::Regex::new(&format!(r#"{}\.workspace\s*=\s*true\s*\n?"#, field)).unwrap();
+        patched = re.replace_all(&patched, "").to_string();
+    }
+
+    // Replace workspace-inherited package fields with defaults
+    // edition.workspace = true -> edition = "2021"
+    let edition_re = regex::Regex::new(r#"edition\.workspace\s*=\s*true"#).unwrap();
+    patched = edition_re
+        .replace_all(&patched, r#"edition = "2021""#)
+        .to_string();
+
+    // version.workspace = true -> version = "0.0.0"
+    let version_re = regex::Regex::new(r#"version\.workspace\s*=\s*true"#).unwrap();
+    patched = version_re
+        .replace_all(&patched, r#"version = "0.0.0""#)
+        .to_string();
+
+    // Handle workspace-inherited dependencies
+    // foo.workspace = true -> foo = "*" or path dep
+    // This is a simple pattern - complex cases might need more handling
+    let ws_dep_re =
+        regex::Regex::new(r#"(?m)^(\s*)([a-zA-Z0-9_-]+)\.workspace\s*=\s*true\s*$"#).unwrap();
+    patched = ws_dep_re
+        .replace_all(&patched, |caps: &regex::Captures| {
+            let indent = &caps[1];
+            let dep_name = &caps[2];
+            // Check if this is one of our path dependencies
+            if all_path_deps.contains_key(dep_name) {
+                format!("{}{} = {{ path = \"../{}\" }}", indent, dep_name, dep_name)
+            } else {
+                // Fall back to wildcard version
+                format!("{}{} = \"*\"", indent, dep_name)
+            }
+        })
+        .to_string();
+
+    // Handle workspace deps with additional attributes
+    // foo = { workspace = true, features = [...] }
+    let ws_dep_detailed_re =
+        regex::Regex::new(r#"(?m)^(\s*)([a-zA-Z0-9_-]+)\s*=\s*\{\s*workspace\s*=\s*true([^}]*)\}"#)
+            .unwrap();
+    patched = ws_dep_detailed_re
+        .replace_all(&patched, |caps: &regex::Captures| {
+            let indent = &caps[1];
+            let dep_name = &caps[2];
+            let extra_attrs = &caps[3];
+            // Check if this is one of our path dependencies
+            if all_path_deps.contains_key(dep_name) {
+                format!(
+                    "{}{} = {{ path = \"../{}\"{}}}",
+                    indent, dep_name, dep_name, extra_attrs
+                )
+            } else {
+                // Fall back to wildcard version
+                format!(
+                    "{}{} = {{ version = \"*\"{}}}",
+                    indent, dep_name, extra_attrs
+                )
+            }
+        })
+        .to_string();
+
+    // Convert path dependencies to use relative paths within deps/
+    // path = "../foo" -> path = "../foo"
+    let path_dep_re = regex::Regex::new(r#"path\s*=\s*"\.\./([\w-]+)""#).unwrap();
+    patched = path_dep_re
+        .replace_all(&patched, |caps: &regex::Captures| {
+            let dep_name = &caps[1];
+            format!("path = \"../{}\"", dep_name)
+        })
+        .to_string();
+
+    fs::write(cargo_toml_path, patched)?;
     Ok(())
 }
 

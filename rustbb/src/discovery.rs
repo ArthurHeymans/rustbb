@@ -24,6 +24,18 @@ pub struct CrateInfo {
     pub has_internal_modules: bool,
     /// Source directory path (usually src/)
     pub src_dir: PathBuf,
+    /// Path dependencies that need to be included (workspace members)
+    /// Maps package name to PathDepInfo
+    pub path_dependencies: BTreeMap<String, PathDepInfo>,
+}
+
+/// Information about a path dependency
+#[derive(Debug, Clone)]
+pub struct PathDepInfo {
+    /// Absolute path to the dependency
+    pub path: PathBuf,
+    /// The alias used in the depending crate (may differ from package name)
+    pub alias: Option<String>,
 }
 
 #[derive(Debug, Clone)]
@@ -58,6 +70,29 @@ pub struct AnalyzeOptions {
     pub enabled_features: Vec<String>,
     /// Whether to disable default features
     pub no_default_features: bool,
+    /// Workspace context for resolving path dependencies
+    pub workspace_context: Option<WorkspaceContext>,
+}
+
+/// Context for resolving workspace-level information
+#[derive(Debug, Clone)]
+pub struct WorkspaceContext {
+    /// Path to the workspace root (where the workspace Cargo.toml is)
+    pub workspace_root: PathBuf,
+    /// Workspace dependencies from [workspace.dependencies]
+    pub workspace_deps: BTreeMap<String, WorkspaceDep>,
+    /// Map of member names to their paths
+    pub member_paths: BTreeMap<String, PathBuf>,
+}
+
+/// A dependency defined in [workspace.dependencies]
+#[derive(Debug, Clone)]
+pub struct WorkspaceDep {
+    pub version: Option<String>,
+    pub features: Vec<String>,
+    pub default_features: bool,
+    pub path: Option<String>,
+    pub git: Option<String>,
 }
 
 /// Analyze a workspace and find the default binary member
@@ -69,14 +104,24 @@ fn analyze_workspace(
     let workspace = manifest.workspace.as_ref().unwrap();
     let mut default_member_error: Option<anyhow::Error> = None;
 
+    // Parse workspace context for resolving path dependencies
+    let workspace_context = parse_workspace_context(workspace_path, manifest)?;
+
+    // Create options with workspace context
+    let options_with_ws = AnalyzeOptions {
+        enabled_features: options.enabled_features.clone(),
+        no_default_features: options.no_default_features,
+        workspace_context: Some(workspace_context.clone()),
+    };
+
     // First, try default-members (these are what `cargo run` would use)
     // If these fail, we should show their error rather than trying other members
     if !workspace.default_members.is_empty() {
         for member in &workspace.default_members {
             let member_path = workspace_path.join(member);
             if member_path.exists() {
-                // Try to analyze this member
-                match analyze_crate_with_options(&member_path, options) {
+                // Try to analyze this member with workspace context
+                match analyze_crate_with_options(&member_path, &options_with_ws) {
                     Ok(info) => return Ok(info),
                     Err(e) => {
                         // Store the error from the default member - we'll show it if
@@ -112,7 +157,7 @@ fn analyze_workspace(
             if member_path.exists() {
                 // Check if this member has a main.rs
                 if member_path.join("src/main.rs").exists() {
-                    match analyze_crate_with_options(&member_path, options) {
+                    match analyze_crate_with_options(&member_path, &options_with_ws) {
                         Ok(info) => return Ok(info),
                         Err(_) => continue,
                     }
@@ -158,6 +203,65 @@ fn glob_workspace_members(workspace_path: &Path, pattern: &str) -> Vec<PathBuf> 
         .unwrap_or_default()
 }
 
+/// Parse workspace context from a workspace Cargo.toml
+fn parse_workspace_context(workspace_path: &Path, manifest: &Manifest) -> Result<WorkspaceContext> {
+    let workspace = manifest.workspace.as_ref().context("Not a workspace")?;
+
+    // Parse workspace.dependencies
+    let mut workspace_deps = BTreeMap::new();
+    for (name, dep) in &workspace.dependencies {
+        let ws_dep = match dep {
+            Dependency::Simple(version) => WorkspaceDep {
+                version: Some(version.clone()),
+                features: vec![],
+                default_features: true,
+                path: None,
+                git: None,
+            },
+            Dependency::Detailed(detail) => WorkspaceDep {
+                version: detail.version.clone(),
+                features: detail.features.clone(),
+                default_features: detail.default_features,
+                path: detail.path.clone(),
+                git: detail.git.clone(),
+            },
+            Dependency::Inherited(_) => {
+                // Shouldn't happen in workspace.dependencies
+                continue;
+            }
+        };
+        workspace_deps.insert(name.clone(), ws_dep);
+    }
+
+    // Build member paths map
+    let mut member_paths = BTreeMap::new();
+    for member_pattern in &workspace.members {
+        let member_dirs = if member_pattern.contains('*') {
+            glob_workspace_members(workspace_path, member_pattern)
+        } else {
+            vec![workspace_path.join(member_pattern)]
+        };
+
+        for member_dir in member_dirs {
+            if member_dir.exists() {
+                // Get the crate name from its Cargo.toml
+                let member_cargo_toml = member_dir.join("Cargo.toml");
+                if let Ok(member_manifest) = Manifest::from_path(&member_cargo_toml) {
+                    if let Some(pkg) = member_manifest.package {
+                        member_paths.insert(pkg.name.clone(), member_dir);
+                    }
+                }
+            }
+        }
+    }
+
+    Ok(WorkspaceContext {
+        workspace_root: workspace_path.to_path_buf(),
+        workspace_deps,
+        member_paths,
+    })
+}
+
 pub fn analyze_crate(path: &Path) -> Result<CrateInfo> {
     analyze_crate_with_options(path, &AnalyzeOptions::default())
 }
@@ -200,24 +304,89 @@ pub fn analyze_crate_with_options(path: &Path, options: &AnalyzeOptions) -> Resu
     // Resolve feature dependencies (features can enable other features)
     effective_features = resolve_features(&effective_features, &manifest.features);
 
-    // Collect regular dependencies
-    let mut dependencies = collect_deps_from_set(&manifest.dependencies, true, &effective_features);
+    // Collect regular dependencies (excluding path deps - we handle those separately)
+    let mut dependencies = collect_deps_from_set(
+        &manifest.dependencies,
+        true,
+        &effective_features,
+        options.workspace_context.as_ref(),
+    );
 
-    // Check for path dependencies that we can't resolve
-    let path_deps: Vec<String> = manifest
-        .dependencies
-        .iter()
-        .filter_map(|(name, dep)| {
-            if let Dependency::Detailed(detail) = dep {
-                if detail.path.is_some() {
-                    return Some(name.clone());
+    // Collect path dependencies and try to resolve them
+    let mut path_dependencies: BTreeMap<String, PathDepInfo> = BTreeMap::new();
+    let mut unresolved_path_deps: Vec<String> = Vec::new();
+
+    for (dep_name, dep) in &manifest.dependencies {
+        if let Dependency::Detailed(detail) = dep {
+            if let Some(rel_path) = &detail.path {
+                // Try to resolve this path dependency
+                let resolved_path = path.join(rel_path).canonicalize().ok();
+
+                if let Some(abs_path) = resolved_path {
+                    if abs_path.exists() {
+                        // Get the actual package name from the target's Cargo.toml
+                        let pkg_name = get_package_name_from_path(&abs_path)
+                            .or_else(|| detail.package.clone())
+                            .unwrap_or_else(|| dep_name.clone());
+
+                        // Determine if this is an alias (renamed dependency)
+                        let alias = if &pkg_name != dep_name {
+                            Some(dep_name.clone())
+                        } else {
+                            None
+                        };
+
+                        path_dependencies.insert(
+                            pkg_name,
+                            PathDepInfo {
+                                path: abs_path,
+                                alias,
+                            },
+                        );
+                        continue;
+                    }
+                }
+
+                // Couldn't resolve this path dependency
+                unresolved_path_deps.push(dep_name.clone());
+            }
+        }
+    }
+
+    // Also check for path deps in build-dependencies
+    for (dep_name, dep) in &manifest.build_dependencies {
+        if let Dependency::Detailed(detail) = dep {
+            if let Some(rel_path) = &detail.path {
+                if let Ok(abs_path) = path.join(rel_path).canonicalize() {
+                    if abs_path.exists() {
+                        let pkg_name = get_package_name_from_path(&abs_path)
+                            .or_else(|| detail.package.clone())
+                            .unwrap_or_else(|| dep_name.clone());
+
+                        let alias = if &pkg_name != dep_name {
+                            Some(dep_name.clone())
+                        } else {
+                            None
+                        };
+
+                        path_dependencies.insert(
+                            pkg_name,
+                            PathDepInfo {
+                                path: abs_path,
+                                alias,
+                            },
+                        );
+                    }
                 }
             }
-            None
-        })
-        .collect();
+        }
+    }
 
-    if !path_deps.is_empty() {
+    // Recursively collect transitive path dependencies
+    collect_transitive_path_deps(&mut path_dependencies);
+
+    // Only error if there are truly unresolved path dependencies
+    if !unresolved_path_deps.is_empty() {
         anyhow::bail!(
             "Crate '{}' has path dependencies that cannot be resolved:\n  {}\n\n\
              Path dependencies are typically workspace members that aren't published to crates.io.\n\
@@ -226,15 +395,19 @@ pub fn analyze_crate_with_options(path: &Path, options: &AnalyzeOptions) -> Resu
              - Build the crate directly with: cargo build --release\n\
              - If this is a workspace, some members may be publishable individually",
             name,
-            path_deps.join(", ")
+            unresolved_path_deps.join(", ")
         );
     }
 
     // Collect target-specific dependencies that apply to the current platform
     for (target_cfg, target) in &manifest.target {
         if cfg_matches_current_platform(target_cfg) {
-            let target_deps =
-                collect_deps_from_set(&target.dependencies, true, &effective_features);
+            let target_deps = collect_deps_from_set(
+                &target.dependencies,
+                true,
+                &effective_features,
+                options.workspace_context.as_ref(),
+            );
             // Merge target deps into main deps
             for (name, info) in target_deps {
                 dependencies.entry(name).or_insert(info);
@@ -269,6 +442,7 @@ pub fn analyze_crate_with_options(path: &Path, options: &AnalyzeOptions) -> Resu
         build_script_outputs: BTreeMap::new(),
         has_internal_modules,
         src_dir,
+        path_dependencies,
     })
 }
 
@@ -448,6 +622,7 @@ fn collect_deps_from_set(
     deps: &DepsSet,
     filter_optional: bool,
     default_features: &[String],
+    workspace_context: Option<&WorkspaceContext>,
 ) -> BTreeMap<String, DepInfo> {
     deps.iter()
         .filter_map(|(name, dep)| {
@@ -462,6 +637,7 @@ fn collect_deps_from_set(
                 ),
                 Dependency::Detailed(detail) => {
                     // Skip path-based dependencies (workspace members, local crates)
+                    // They are handled separately in path_dependencies
                     if detail.path.is_some() {
                         return None;
                     }
@@ -494,9 +670,32 @@ fn collect_deps_from_set(
                     )
                 }
                 Dependency::Inherited(inherited) => {
-                    // Inherited dependencies without version info can't be resolved
-                    // Skip them unless we have workspace context
+                    // Handle workspace-inherited dependencies
                     if inherited.workspace {
+                        // Try to resolve from workspace context
+                        if let Some(ws_ctx) = workspace_context {
+                            if let Some(ws_dep) = ws_ctx.workspace_deps.get(name) {
+                                // Skip if it's a path dependency in the workspace
+                                if ws_dep.path.is_some() {
+                                    return None;
+                                }
+                                // Merge features from both workspace def and local override
+                                let mut features = ws_dep.features.clone();
+                                features.extend(inherited.features.iter().cloned());
+                                features.sort();
+                                features.dedup();
+
+                                return Some((
+                                    name.clone(),
+                                    DepInfo {
+                                        version: ws_dep.version.clone(),
+                                        features,
+                                        optional: inherited.optional,
+                                    },
+                                ));
+                            }
+                        }
+                        // Can't resolve workspace dependency without context
                         return None;
                     }
                     // Handle optional dependencies
@@ -523,6 +722,105 @@ fn collect_deps_from_set(
             info.map(|i| (actual_name, i))
         })
         .collect()
+}
+
+/// Get the package name from a crate's Cargo.toml
+fn get_package_name_from_path(crate_path: &Path) -> Option<String> {
+    let cargo_toml = crate_path.join("Cargo.toml");
+    if let Ok(manifest) = Manifest::from_path(&cargo_toml) {
+        return manifest.package.map(|p| p.name);
+    }
+    None
+}
+
+/// Recursively collect transitive path dependencies
+/// This ensures we include all path dependencies of path dependencies
+fn collect_transitive_path_deps(path_deps: &mut BTreeMap<String, PathDepInfo>) {
+    let mut to_process: Vec<PathBuf> = path_deps.values().map(|d| d.path.clone()).collect();
+    let mut processed: std::collections::HashSet<PathBuf> = to_process.iter().cloned().collect();
+
+    while let Some(dep_path) = to_process.pop() {
+        let cargo_toml = dep_path.join("Cargo.toml");
+        if let Ok(manifest) = Manifest::from_path(&cargo_toml) {
+            // Check regular dependencies
+            for (dep_name, dep) in &manifest.dependencies {
+                collect_path_dep_if_present(
+                    dep_name,
+                    dep,
+                    &dep_path,
+                    path_deps,
+                    &mut to_process,
+                    &mut processed,
+                );
+            }
+
+            // Check build dependencies
+            for (dep_name, dep) in &manifest.build_dependencies {
+                collect_path_dep_if_present(
+                    dep_name,
+                    dep,
+                    &dep_path,
+                    path_deps,
+                    &mut to_process,
+                    &mut processed,
+                );
+            }
+
+            // Check dev dependencies (might be needed for tests)
+            for (dep_name, dep) in &manifest.dev_dependencies {
+                collect_path_dep_if_present(
+                    dep_name,
+                    dep,
+                    &dep_path,
+                    path_deps,
+                    &mut to_process,
+                    &mut processed,
+                );
+            }
+        }
+    }
+}
+
+/// Helper to collect a path dependency if present
+fn collect_path_dep_if_present(
+    dep_name: &str,
+    dep: &Dependency,
+    base_path: &Path,
+    path_deps: &mut BTreeMap<String, PathDepInfo>,
+    to_process: &mut Vec<PathBuf>,
+    processed: &mut std::collections::HashSet<PathBuf>,
+) {
+    if let Dependency::Detailed(detail) = dep {
+        if let Some(rel_path) = &detail.path {
+            if let Ok(abs_path) = base_path.join(rel_path).canonicalize() {
+                if abs_path.exists() && !processed.contains(&abs_path) {
+                    processed.insert(abs_path.clone());
+
+                    let pkg_name = get_package_name_from_path(&abs_path)
+                        .or_else(|| detail.package.clone())
+                        .unwrap_or_else(|| dep_name.to_string());
+
+                    let alias = if &pkg_name != dep_name {
+                        Some(dep_name.to_string())
+                    } else {
+                        None
+                    };
+
+                    // Only add if we don't already have this package
+                    if !path_deps.contains_key(&pkg_name) {
+                        path_deps.insert(
+                            pkg_name,
+                            PathDepInfo {
+                                path: abs_path.clone(),
+                                alias,
+                            },
+                        );
+                        to_process.push(abs_path);
+                    }
+                }
+            }
+        }
+    }
 }
 
 fn find_main_rs(crate_path: &Path, manifest: &Manifest) -> Result<PathBuf> {
