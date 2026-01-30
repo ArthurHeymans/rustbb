@@ -60,6 +60,14 @@ enum Commands {
         /// Cache directory for downloaded crates
         #[arg(long)]
         cache_dir: Option<PathBuf>,
+
+        /// Features to enable (comma-separated, applies to all crates)
+        #[arg(long)]
+        features: Option<String>,
+
+        /// Disable default features for all crates
+        #[arg(long)]
+        no_default_features: bool,
     },
 }
 
@@ -102,6 +110,8 @@ fn main() -> Result<()> {
             output,
             release,
             cache_dir,
+            features,
+            no_default_features,
         } => {
             let cache_dir = cache_dir.unwrap_or_else(|| std::env::temp_dir().join("rustbb-cache"));
             std::fs::create_dir_all(&cache_dir)?;
@@ -133,8 +143,19 @@ fn main() -> Result<()> {
             // Convert to paths for the builder
             let crate_paths: Vec<PathBuf> = fetched_crates.iter().map(|f| f.path.clone()).collect();
 
+            // Parse features
+            let enabled_features: Vec<String> = features
+                .map(|f| f.split(',').map(|s| s.trim().to_string()).collect())
+                .unwrap_or_default();
+
             // Build
-            builder::build(&crate_paths, &output, release)?;
+            builder::build(
+                &crate_paths,
+                &output,
+                release,
+                &enabled_features,
+                no_default_features,
+            )?;
         }
     }
 

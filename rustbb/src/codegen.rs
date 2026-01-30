@@ -21,9 +21,10 @@ pub fn generate_combined_crate(
     output_name: &str,
     transformed_sources: &HashMap<String, String>,
     runtime_path: &str,
+    enabled_features: &[String],
 ) -> Result<GeneratedCrate> {
     // Generate Cargo.toml
-    let cargo_toml = generate_cargo_toml(crates, output_name, runtime_path)?;
+    let cargo_toml = generate_cargo_toml(crates, output_name, runtime_path, enabled_features)?;
 
     // Generate main.rs
     let main_rs = generate_main_rs(crates)?;
@@ -57,6 +58,7 @@ fn generate_cargo_toml(
     crates: &[CrateInfo],
     output_name: &str,
     runtime_path: &str,
+    enabled_features: &[String],
 ) -> Result<String> {
     // Merge dependencies from all crates
     let merged_deps = merge_dependencies(crates);
@@ -66,6 +68,18 @@ fn generate_cargo_toml(
         let dep_spec = format_dependency(name, info);
         deps_str.push_str(&dep_spec);
         deps_str.push('\n');
+    }
+
+    // Collect all features from source crates that are enabled
+    // This allows #[cfg(feature = "...")] to work in the combined binary
+    let mut features_str = String::new();
+    if !enabled_features.is_empty() {
+        features_str.push_str("[features]\n");
+        for feature in enabled_features {
+            // Create an empty feature that can be used in cfg
+            features_str.push_str(&format!("{} = []\n", feature));
+        }
+        features_str.push('\n');
     }
 
     let toml = format!(
@@ -78,7 +92,7 @@ edition = "2021"
 name = "{output_name}"
 path = "src/main.rs"
 
-[dependencies]
+{features_str}[dependencies]
 rustbb_runtime = {{ path = "{runtime_path}" }}
 {deps_str}
 [profile.release]

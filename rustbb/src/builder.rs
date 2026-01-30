@@ -6,14 +6,26 @@ use std::process::Command;
 use tempfile::TempDir;
 
 use crate::codegen::{generate_combined_crate, GeneratedCrate};
-use crate::discovery::{analyze_crate, run_build_script, CrateInfo, TransformStrategy};
+use crate::discovery::{
+    analyze_crate_with_options, run_build_script, AnalyzeOptions, CrateInfo, TransformStrategy,
+};
 use crate::transform::{
     sanitize_name, transform_main, transform_main_for_module, transform_main_with_build_outputs,
 };
 
-pub fn build(crate_paths: &[PathBuf], output_name: &str, release: bool) -> Result<()> {
+pub fn build(
+    crate_paths: &[PathBuf],
+    output_name: &str,
+    release: bool,
+    enabled_features: &[String],
+    no_default_features: bool,
+) -> Result<()> {
     // Step 1: Analyze all crates
     println!("Analyzing crates...");
+    let analyze_options = AnalyzeOptions {
+        enabled_features: enabled_features.to_vec(),
+        no_default_features,
+    };
     let crate_infos: Vec<CrateInfo> = crate_paths
         .iter()
         .map(|p| {
@@ -22,7 +34,7 @@ pub fn build(crate_paths: &[PathBuf], output_name: &str, release: bool) -> Resul
             } else {
                 std::env::current_dir()?.join(p)
             };
-            analyze_crate(&abs_path)
+            analyze_crate_with_options(&abs_path, &analyze_options)
         })
         .collect::<Result<Vec<_>>>()?;
 
@@ -190,6 +202,7 @@ pub fn build(crate_paths: &[PathBuf], output_name: &str, release: bool) -> Resul
         output_name,
         &transformed,
         &runtime_path.display().to_string(),
+        enabled_features,
     )?;
 
     // Step 4: Write to temp directory
@@ -204,6 +217,10 @@ pub fn build(crate_paths: &[PathBuf], output_name: &str, release: bool) -> Resul
     cmd.arg("build");
     if release {
         cmd.arg("--release");
+    }
+    if !enabled_features.is_empty() {
+        cmd.arg("--features");
+        cmd.arg(enabled_features.join(","));
     }
     cmd.current_dir(temp_dir.path());
 

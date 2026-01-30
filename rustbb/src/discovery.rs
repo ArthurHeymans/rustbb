@@ -51,7 +51,20 @@ pub enum TransformStrategy {
     Unsupported { reason: String },
 }
 
+/// Options for analyzing a crate
+#[derive(Debug, Clone, Default)]
+pub struct AnalyzeOptions {
+    /// Additional features to enable
+    pub enabled_features: Vec<String>,
+    /// Whether to disable default features
+    pub no_default_features: bool,
+}
+
 pub fn analyze_crate(path: &Path) -> Result<CrateInfo> {
+    analyze_crate_with_options(path, &AnalyzeOptions::default())
+}
+
+pub fn analyze_crate_with_options(path: &Path, options: &AnalyzeOptions) -> Result<CrateInfo> {
     let cargo_toml_path = path.join("Cargo.toml");
     let manifest = Manifest::from_path(&cargo_toml_path).context("Failed to parse Cargo.toml")?;
 
@@ -68,20 +81,30 @@ pub fn analyze_crate(path: &Path) -> Result<CrateInfo> {
     let source = fs::read_to_string(&main_path).context("Failed to read main.rs")?;
     let strategy = analyze_main_function(&source)?;
 
-    // Get default features to know which optional deps are enabled
-    let default_features: Vec<String> = manifest
-        .features
-        .get("default")
-        .cloned()
-        .unwrap_or_default();
+    // Compute effective features
+    let mut effective_features: Vec<String> = Vec::new();
+
+    // Add default features unless disabled
+    if !options.no_default_features {
+        if let Some(defaults) = manifest.features.get("default") {
+            effective_features.extend(defaults.iter().cloned());
+        }
+    }
+
+    // Add user-specified features
+    effective_features.extend(options.enabled_features.iter().cloned());
+
+    // Resolve feature dependencies (features can enable other features)
+    effective_features = resolve_features(&effective_features, &manifest.features);
 
     // Collect regular dependencies
-    let mut dependencies = collect_deps_from_set(&manifest.dependencies, true, &default_features);
+    let mut dependencies = collect_deps_from_set(&manifest.dependencies, true, &effective_features);
 
     // Collect target-specific dependencies that apply to the current platform
     for (target_cfg, target) in &manifest.target {
         if cfg_matches_current_platform(target_cfg) {
-            let target_deps = collect_deps_from_set(&target.dependencies, true, &default_features);
+            let target_deps =
+                collect_deps_from_set(&target.dependencies, true, &effective_features);
             // Merge target deps into main deps
             for (name, info) in target_deps {
                 dependencies.entry(name).or_insert(info);
@@ -117,6 +140,34 @@ pub fn analyze_crate(path: &Path) -> Result<CrateInfo> {
         has_internal_modules,
         src_dir,
     })
+}
+
+/// Resolve feature dependencies - features can enable other features
+fn resolve_features(
+    enabled: &[String],
+    all_features: &std::collections::BTreeMap<String, Vec<String>>,
+) -> Vec<String> {
+    let mut resolved: std::collections::HashSet<String> = enabled.iter().cloned().collect();
+    let mut to_process: Vec<String> = enabled.to_vec();
+
+    while let Some(feature) = to_process.pop() {
+        if let Some(deps) = all_features.get(&feature) {
+            for dep in deps {
+                // Handle dep:crate_name syntax
+                let dep_name = dep.strip_prefix("dep:").unwrap_or(dep);
+
+                // Handle crate_name/feature syntax
+                let dep_name = dep_name.split('/').next().unwrap_or(dep_name);
+
+                if !resolved.contains(dep_name) {
+                    resolved.insert(dep_name.to_string());
+                    to_process.push(dep_name.to_string());
+                }
+            }
+        }
+    }
+
+    resolved.into_iter().collect()
 }
 
 /// Check if source code has internal `mod` declarations (not `mod name;` but actual modules)
