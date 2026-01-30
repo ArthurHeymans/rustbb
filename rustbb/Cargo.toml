@@ -1,0 +1,26 @@
+[package]
+name = "rustbb"
+version.workspace = true
+edition.workspace = true
+description = "Combine Rust CLI crates into a single multi-call binary (like gobusybox for Rust)"
+
+[dependencies]
+# CLI
+clap = { version = "4", features = ["derive"] }
+
+# Rust parsing/generation
+syn = { version = "2", features = ["full", "parsing", "visit-mut", "printing"] }
+quote = "1"
+proc-macro2 = "1"
+prettyplease = "0.2"
+
+# Cargo.toml parsing
+toml = "0.8"
+cargo_toml = "0.20"
+
+# Utilities
+anyhow = "1"
+thiserror = "1"
+tempfile = "3"
+tracing = "0.1"
+tracing-subscriber = "0.3"

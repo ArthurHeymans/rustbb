@@ -1,0 +1,8 @@
+[package]
+name = "rustbb_runtime"
+version.workspace = true
+edition.workspace = true
+description = "Runtime library for rustbb multi-call binaries"
+
+# Minimal dependencies for small binary size
+[dependencies]

@@ -1,0 +1,16 @@
+[workspace]
+resolver = "2"
+members = [
+    "rustbb",
+    "rustbb_runtime",
+    "examples/simple_echo",
+    "examples/simple_cat",
+    "examples/head",
+    "examples/wc",
+    "examples/async_hello",
+]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2021"
+license = "MIT OR Apache-2.0"
