@@ -60,6 +60,104 @@ pub struct AnalyzeOptions {
     pub no_default_features: bool,
 }
 
+/// Analyze a workspace and find the default binary member
+fn analyze_workspace(
+    workspace_path: &Path,
+    manifest: &Manifest,
+    options: &AnalyzeOptions,
+) -> Result<CrateInfo> {
+    let workspace = manifest.workspace.as_ref().unwrap();
+    let mut default_member_error: Option<anyhow::Error> = None;
+
+    // First, try default-members (these are what `cargo run` would use)
+    // If these fail, we should show their error rather than trying other members
+    if !workspace.default_members.is_empty() {
+        for member in &workspace.default_members {
+            let member_path = workspace_path.join(member);
+            if member_path.exists() {
+                // Try to analyze this member
+                match analyze_crate_with_options(&member_path, options) {
+                    Ok(info) => return Ok(info),
+                    Err(e) => {
+                        // Store the error from the default member - we'll show it if
+                        // it's about path deps since that's the most useful info
+                        default_member_error = Some(e);
+                        continue;
+                    }
+                }
+            }
+        }
+    }
+
+    // If we tried default members and they all failed with path dependency errors,
+    // show that error - it's more informative than "no binary found"
+    if let Some(ref err) = default_member_error {
+        let err_str = err.to_string();
+        if err_str.contains("path dependencies") {
+            // Return the error from the default member
+            return Err(default_member_error.unwrap());
+        }
+    }
+
+    // If no default-members or they failed for other reasons, try to find any member with a binary
+    for member_pattern in &workspace.members {
+        // Handle glob patterns like "crates/*"
+        let member_paths = if member_pattern.contains('*') {
+            glob_workspace_members(workspace_path, member_pattern)
+        } else {
+            vec![workspace_path.join(member_pattern)]
+        };
+
+        for member_path in member_paths {
+            if member_path.exists() {
+                // Check if this member has a main.rs
+                if member_path.join("src/main.rs").exists() {
+                    match analyze_crate_with_options(&member_path, options) {
+                        Ok(info) => return Ok(info),
+                        Err(_) => continue,
+                    }
+                }
+            }
+        }
+    }
+
+    // If we had an error from the default member, prefer showing that
+    if let Some(err) = default_member_error {
+        return Err(err);
+    }
+
+    // Build a helpful error message listing the workspace members
+    let members_list = workspace.members.join(", ");
+    let default_members_info = if !workspace.default_members.is_empty() {
+        format!(
+            "\n  Default members: {}",
+            workspace.default_members.join(", ")
+        )
+    } else {
+        String::new()
+    };
+
+    anyhow::bail!(
+        "This is a Cargo workspace without a directly runnable binary.\n  \
+         Members: {}{}\n  \
+         Try specifying the binary member directly, e.g.:\n    \
+         rustbb build {}/helix-term",
+        members_list,
+        default_members_info,
+        workspace_path.display()
+    )
+}
+
+/// Expand glob patterns in workspace member paths
+fn glob_workspace_members(workspace_path: &Path, pattern: &str) -> Vec<PathBuf> {
+    let full_pattern = workspace_path.join(pattern);
+    let pattern_str = full_pattern.to_string_lossy();
+
+    glob::glob(&pattern_str)
+        .map(|paths| paths.filter_map(|p| p.ok()).collect())
+        .unwrap_or_default()
+}
+
 pub fn analyze_crate(path: &Path) -> Result<CrateInfo> {
     analyze_crate_with_options(path, &AnalyzeOptions::default())
 }
@@ -67,6 +165,11 @@ pub fn analyze_crate(path: &Path) -> Result<CrateInfo> {
 pub fn analyze_crate_with_options(path: &Path, options: &AnalyzeOptions) -> Result<CrateInfo> {
     let cargo_toml_path = path.join("Cargo.toml");
     let manifest = Manifest::from_path(&cargo_toml_path).context("Failed to parse Cargo.toml")?;
+
+    // Check if this is a workspace - if so, find the default binary member
+    if manifest.workspace.is_some() && manifest.package.is_none() {
+        return analyze_workspace(path, &manifest, options);
+    }
 
     let name = manifest
         .package
@@ -99,6 +202,33 @@ pub fn analyze_crate_with_options(path: &Path, options: &AnalyzeOptions) -> Resu
 
     // Collect regular dependencies
     let mut dependencies = collect_deps_from_set(&manifest.dependencies, true, &effective_features);
+
+    // Check for path dependencies that we can't resolve
+    let path_deps: Vec<String> = manifest
+        .dependencies
+        .iter()
+        .filter_map(|(name, dep)| {
+            if let Dependency::Detailed(detail) = dep {
+                if detail.path.is_some() {
+                    return Some(name.clone());
+                }
+            }
+            None
+        })
+        .collect();
+
+    if !path_deps.is_empty() {
+        anyhow::bail!(
+            "Crate '{}' has path dependencies that cannot be resolved:\n  {}\n\n\
+             Path dependencies are typically workspace members that aren't published to crates.io.\n\
+             This crate cannot be built standalone with rustbb.\n\n\
+             Options:\n\
+             - Build the crate directly with: cargo build --release\n\
+             - If this is a workspace, some members may be publishable individually",
+            name,
+            path_deps.join(", ")
+        );
+    }
 
     // Collect target-specific dependencies that apply to the current platform
     for (target_cfg, target) in &manifest.target {
@@ -418,7 +548,75 @@ fn find_main_rs(crate_path: &Path, manifest: &Manifest) -> Result<PathBuf> {
         }
     }
 
-    anyhow::bail!("Could not find main.rs in {:?}", crate_path)
+    // Build a helpful error message
+    let crate_name = manifest
+        .package
+        .as_ref()
+        .map(|p| p.name.as_str())
+        .unwrap_or("unknown");
+
+    let has_lib = crate_path.join("src/lib.rs").exists() || manifest.lib.is_some();
+    let description = manifest
+        .package
+        .as_ref()
+        .and_then(|p| p.description.as_ref())
+        .and_then(|d| d.get().ok())
+        .map(|s| s.as_str())
+        .unwrap_or("");
+
+    let mut error_msg = format!(
+        "Crate '{}' does not have a binary target (no main.rs found)",
+        crate_name
+    );
+
+    if has_lib {
+        error_msg.push_str(&format!(
+            "\n  This appears to be a library-only crate (has lib.rs but no main.rs)"
+        ));
+    }
+
+    if !description.is_empty() {
+        error_msg.push_str(&format!("\n  Description: {}", description));
+    }
+
+    // Check for common naming confusions
+    let suggestions = get_crate_suggestions(crate_name);
+    if !suggestions.is_empty() {
+        error_msg.push_str("\n  Did you mean one of these?");
+        for suggestion in suggestions {
+            error_msg.push_str(&format!("\n    - {}", suggestion));
+        }
+    }
+
+    // Check if there are bin entries that don't have paths
+    let bin_names: Vec<&str> = manifest
+        .bin
+        .iter()
+        .filter_map(|b| b.name.as_deref())
+        .collect();
+    if !bin_names.is_empty() {
+        error_msg.push_str(&format!(
+            "\n  Note: Cargo.toml declares binaries {:?} but source files are missing",
+            bin_names
+        ));
+    }
+
+    anyhow::bail!("{}", error_msg)
+}
+
+/// Get suggestions for commonly confused crate names
+fn get_crate_suggestions(crate_name: &str) -> Vec<&'static str> {
+    match crate_name {
+        "helix" => vec!["github:helix-editor/helix (Helix text editor - not on crates.io)"],
+        "helix-term" => {
+            vec!["github:helix-editor/helix (Helix text editor - helix-term is just a placeholder)"]
+        }
+        "vim" | "neovim" | "nvim" => {
+            vec!["github:neovim/neovim (Neovim is written in C, not Rust)"]
+        }
+        "code" | "vscode" => vec!["VSCode is written in TypeScript, not Rust"],
+        _ => vec![],
+    }
 }
 
 fn analyze_main_function(source: &str) -> Result<TransformStrategy> {
