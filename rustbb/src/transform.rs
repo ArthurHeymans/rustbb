@@ -1,6 +1,7 @@
 use anyhow::{Context, Result};
 use proc_macro2::Span;
 use quote::quote;
+use std::collections::HashMap;
 use syn::{
     parse_file, parse_quote, visit_mut::VisitMut, Expr, ExprCall, ExprPath, Ident, ItemFn,
     Visibility,
@@ -216,6 +217,71 @@ fn detect_async_runtime(func: &ItemFn) -> Option<AsyncRuntime> {
     }
 
     None
+}
+
+/// Transform a crate's main.rs that uses build script generated code
+/// Returns the transformed source and a map of which build outputs were used
+pub fn transform_main_with_build_outputs(
+    source: &str,
+    cmd_name: &str,
+    build_outputs: &std::collections::BTreeMap<String, String>,
+) -> Result<(String, HashMap<String, String>)> {
+    // First, inline all include! macros that reference OUT_DIR
+    let mut modified_source = source.to_string();
+    let mut used_outputs = HashMap::new();
+
+    // Find and replace include!(concat!(env!("OUT_DIR"), "/filename.rs"))
+    // This is a simplified regex-based approach
+    let include_pattern = regex::Regex::new(
+        r#"include!\s*\(\s*concat!\s*\(\s*env!\s*\(\s*"OUT_DIR"\s*\)\s*,\s*"([^"]+)"\s*\)\s*\)"#,
+    )
+    .unwrap();
+
+    for captures in include_pattern.captures_iter(source) {
+        let full_match = captures.get(0).unwrap().as_str();
+        let filename = captures.get(1).unwrap().as_str();
+
+        // Remove leading slash if present
+        let clean_filename = filename.trim_start_matches('/');
+
+        if let Some(content) = build_outputs.get(clean_filename) {
+            // Check if the generated code references external modules we don't have
+            // This detects multi-call binaries like coreutils that reference utility modules
+            if looks_like_multicall_dispatch(content) {
+                anyhow::bail!(
+                    "This crate appears to be a multi-call binary itself (like BusyBox/coreutils). \
+                     The build script generates dispatch code that references external utility modules. \
+                     Consider using the individual utility crates instead (e.g., uu_cat, uu_ls for coreutils)."
+                );
+            }
+
+            // Replace the include! with the actual content
+            modified_source = modified_source.replace(full_match, content);
+            used_outputs.insert(clean_filename.to_string(), content.clone());
+        } else {
+            anyhow::bail!(
+                "Build output file '{}' not found. Available: {:?}",
+                clean_filename,
+                build_outputs.keys().collect::<Vec<_>>()
+            );
+        }
+    }
+
+    // Now transform the modified source
+    let transformed = transform_main(&modified_source, cmd_name)?;
+
+    Ok((transformed, used_outputs))
+}
+
+/// Detect if generated code looks like a multi-call binary dispatch table
+fn looks_like_multicall_dispatch(content: &str) -> bool {
+    // Check for patterns that indicate a dispatch table for utilities
+    // e.g., ("cat", (cat::uumain, cat::uu_app)) or similar patterns
+    let dispatch_pattern = regex::Regex::new(r#"\("[a-z_]+",\s*\([a-z_]+::\w+,"#).unwrap();
+    let matches = dispatch_pattern.find_iter(content).count();
+
+    // If there are many dispatch entries (more than 5), this is likely a multi-call binary
+    matches > 5
 }
 
 pub fn sanitize_name(name: &str) -> String {

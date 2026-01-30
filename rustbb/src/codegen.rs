@@ -199,6 +199,7 @@ mod tests {
                 dependencies: BTreeMap::new(),
                 has_library: false,
                 version: None,
+                build_script_outputs: BTreeMap::new(),
             },
             CrateInfo {
                 name: "cat".to_string(),
@@ -208,6 +209,7 @@ mod tests {
                 dependencies: BTreeMap::new(),
                 has_library: false,
                 version: None,
+                build_script_outputs: BTreeMap::new(),
             },
         ];
 
@@ -240,6 +242,7 @@ mod tests {
                 },
                 has_library: false,
                 version: None,
+                build_script_outputs: BTreeMap::new(),
             },
             CrateInfo {
                 name: "cmd2".to_string(),
@@ -260,6 +263,7 @@ mod tests {
                 },
                 has_library: false,
                 version: None,
+                build_script_outputs: BTreeMap::new(),
             },
         ];
 

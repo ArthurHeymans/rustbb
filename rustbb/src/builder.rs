@@ -6,8 +6,8 @@ use std::process::Command;
 use tempfile::TempDir;
 
 use crate::codegen::{generate_combined_crate, GeneratedCrate};
-use crate::discovery::{analyze_crate, CrateInfo, TransformStrategy};
-use crate::transform::{sanitize_name, transform_main};
+use crate::discovery::{analyze_crate, run_build_script, CrateInfo, TransformStrategy};
+use crate::transform::{sanitize_name, transform_main, transform_main_with_build_outputs};
 
 pub fn build(crate_paths: &[PathBuf], output_name: &str, release: bool) -> Result<()> {
     // Step 1: Analyze all crates
@@ -27,6 +27,7 @@ pub fn build(crate_paths: &[PathBuf], output_name: &str, release: bool) -> Resul
     // Step 2: Transform each crate
     println!("Transforming {} crates...", crate_infos.len());
     let mut transformed = HashMap::new();
+    let mut build_outputs_map: HashMap<String, HashMap<String, String>> = HashMap::new();
 
     for info in &crate_infos {
         match &info.strategy {
@@ -85,6 +86,50 @@ pub fn build(crate_paths: &[PathBuf], output_name: &str, release: bool) -> Resul
                         info.name, unsupported
                     );
                 }
+            }
+            TransformStrategy::BuildScriptMain { attrs } => {
+                // Run build script to generate OUT_DIR files
+                match run_build_script(&info.path, &info.name) {
+                    Ok(build_outputs) => {
+                        let source = fs::read_to_string(&info.main_path)?;
+
+                        // Check for async runtime
+                        let is_async = attrs
+                            .iter()
+                            .any(|a| matches!(a.as_str(), "tokio::main" | "async_std::main"));
+
+                        match transform_main_with_build_outputs(&source, &info.name, &build_outputs)
+                        {
+                            Ok((transformed_source, used_outputs)) => {
+                                transformed.insert(info.name.clone(), transformed_source);
+                                // Store the build outputs in the crate info for codegen
+                                // We'll need to pass these to generate_combined_crate
+                                let suffix = if is_async {
+                                    " (async, build.rs)"
+                                } else {
+                                    " (build.rs)"
+                                };
+                                println!("  ✓ {}{}", info.name, suffix);
+
+                                // Update crate info with build outputs
+                                // Note: we need to handle this differently since we're iterating
+                                build_outputs_map.insert(info.name.clone(), used_outputs);
+                            }
+                            Err(e) => {
+                                println!("  ✗ {} - transform failed: {}", info.name, e);
+                            }
+                        }
+                    }
+                    Err(e) => {
+                        println!("  ✗ {} - build script failed: {}", info.name, e);
+                    }
+                }
+            }
+            TransformStrategy::UucoreBinMacro { crate_name } => {
+                // For uucore::bin! macro, we generate a wrapper that calls the library's uumain
+                let wrapper_source = generate_uucore_wrapper(&crate_name, &info.name);
+                transformed.insert(info.name.clone(), wrapper_source);
+                println!("  ✓ {} (uucore)", info.name);
             }
             TransformStrategy::Unsupported { reason } => {
                 println!("  ✗ {} - {}", info.name, reason);
@@ -287,5 +332,21 @@ fn find_runtime_path() -> Result<PathBuf> {
     anyhow::bail!(
         "Could not find rustbb_runtime. Make sure you're running from the workspace directory \
          or that rustbb_runtime is in the same directory as rustbb."
+    )
+}
+
+/// Generate a wrapper for uucore::bin! crates (uutils coreutils utilities)
+fn generate_uucore_wrapper(uucore_crate_name: &str, cmd_name: &str) -> String {
+    let sanitized = sanitize_name(cmd_name);
+    // The uucore crate exports `uumain` which takes Args and returns i32
+    // We generate a wrapper that calls it with our args
+    format!(
+        r#"/// Auto-generated wrapper for {crate_name}
+pub fn rustbb_cmd_{sanitized}() -> i32 {{
+    {crate_name}::uumain(rustbb_runtime::args_os())
+}}
+"#,
+        crate_name = uucore_crate_name,
+        sanitized = sanitized,
     )
 }
