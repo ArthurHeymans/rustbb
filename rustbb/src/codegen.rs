@@ -215,8 +215,17 @@ fn merge_dependencies(crates: &[CrateInfo]) -> BTreeMap<String, DepInfo> {
                 // Use the most specific version (prefer explicit over None)
                 if existing.version.is_none() && info.version.is_some() {
                     existing.version = info.version.clone();
+                } else if let (Some(existing_ver), Some(new_ver)) =
+                    (&existing.version, &info.version)
+                {
+                    // Warn about version conflicts between crates
+                    if existing_ver != new_ver {
+                        eprintln!(
+                            "  ⚠ Dependency version conflict for '{}': {} vs {} (using {})",
+                            name, existing_ver, new_ver, existing_ver
+                        );
+                    }
                 }
-                // If both have versions, we'd ideally resolve them, but for now keep the first
             } else {
                 merged.insert(name.clone(), info.clone());
             }

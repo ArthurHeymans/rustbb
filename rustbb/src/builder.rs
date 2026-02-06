@@ -398,17 +398,9 @@ fn write_generated_crate(temp_dir: &TempDir, generated: &GeneratedCrate) -> Resu
     }
 
     // Copy .cargo/config.toml if it exists (for linker settings, etc.)
-    copy_cargo_config(base)?;
+    crate::util::copy_cargo_config(base)?;
 
     Ok(())
-}
-
-/// Find the workspace root (common parent directory of all path dependencies)
-fn find_workspace_root(
-    path_deps: &std::collections::BTreeMap<String, crate::codegen::GeneratedCrate>,
-) -> Option<PathBuf> {
-    // This is a simplified implementation - we'll use it with the actual type later
-    None
 }
 
 /// Find the workspace root from path dependencies
@@ -531,123 +523,199 @@ fn copy_dir_all(src: &Path, dst: &Path) -> Result<()> {
 }
 
 /// Patch a workspace member's Cargo.toml to remove workspace inheritance
-/// and convert path dependencies to use the deps/ directory
+/// and convert path dependencies to use the deps/ directory.
+///
+/// Uses proper TOML parsing instead of regex to handle multi-line values,
+/// comments, and non-standard formatting correctly.
 fn patch_workspace_cargo_toml(
     cargo_toml_path: &Path,
     all_path_deps: &std::collections::BTreeMap<String, PathBuf>,
 ) -> Result<()> {
     let content = fs::read_to_string(cargo_toml_path)?;
+    let mut doc: toml::Value =
+        toml::from_str(&content).context("Failed to parse Cargo.toml as TOML")?;
 
-    // Use regex to patch the content
-    let mut patched = content.clone();
+    // Patch [package] section: remove workspace inheritance, set defaults
+    if let Some(package) = doc.get_mut("package").and_then(|v| v.as_table_mut()) {
+        // Fields that should be removed if they are workspace-inherited
+        let remove_fields = [
+            "authors",
+            "license",
+            "rust-version",
+            "categories",
+            "repository",
+            "homepage",
+            "keywords",
+            "readme",
+            "documentation",
+        ];
+        for field in remove_fields {
+            if is_workspace_inherited(package.get(field)) {
+                package.remove(field);
+            }
+        }
 
-    // First, remove workspace-inherited package fields that aren't critical
-    // (Do this BEFORE replacing version, since rust-version contains "version")
-    let remove_fields = [
-        "authors",
-        "license",
-        "rust-version",
-        "categories",
-        "repository",
-        "homepage",
-        "keywords",
-        "readme",
-        "documentation",
-    ];
-    for field in remove_fields {
-        let re = regex::Regex::new(&format!(r#"{}\.workspace\s*=\s*true\s*\n?"#, field)).unwrap();
-        patched = re.replace_all(&patched, "").to_string();
+        // Replace workspace-inherited edition with default
+        if is_workspace_inherited(package.get("edition")) {
+            package.insert(
+                "edition".to_string(),
+                toml::Value::String("2021".to_string()),
+            );
+        }
+
+        // Replace workspace-inherited version with placeholder
+        if is_workspace_inherited(package.get("version")) {
+            package.insert(
+                "version".to_string(),
+                toml::Value::String("0.0.0".to_string()),
+            );
+        }
     }
 
-    // Replace workspace-inherited package fields with defaults
-    // edition.workspace = true -> edition = "2021"
-    let edition_re = regex::Regex::new(r#"edition\.workspace\s*=\s*true"#).unwrap();
-    patched = edition_re
-        .replace_all(&patched, r#"edition = "2021""#)
-        .to_string();
+    // Patch all dependency sections
+    let dep_section_keys: Vec<String> = collect_dep_section_keys(&doc);
+    for key in dep_section_keys {
+        patch_dep_section(&mut doc, &key, all_path_deps);
+    }
 
-    // version.workspace = true -> version = "0.0.0"
-    let version_re = regex::Regex::new(r#"version\.workspace\s*=\s*true"#).unwrap();
-    patched = version_re
-        .replace_all(&patched, r#"version = "0.0.0""#)
-        .to_string();
-
-    // Handle workspace-inherited dependencies
-    // foo.workspace = true -> foo = "*" or path dep
-    // This is a simple pattern - complex cases might need more handling
-    let ws_dep_re =
-        regex::Regex::new(r#"(?m)^(\s*)([a-zA-Z0-9_-]+)\.workspace\s*=\s*true\s*$"#).unwrap();
-    patched = ws_dep_re
-        .replace_all(&patched, |caps: &regex::Captures| {
-            let indent = &caps[1];
-            let dep_name = &caps[2];
-            // Check if this is one of our path dependencies
-            if all_path_deps.contains_key(dep_name) {
-                format!("{}{} = {{ path = \"../{}\" }}", indent, dep_name, dep_name)
-            } else {
-                // Fall back to wildcard version
-                format!("{}{} = \"*\"", indent, dep_name)
-            }
-        })
-        .to_string();
-
-    // Handle workspace deps with additional attributes
-    // foo = { workspace = true, features = [...] }
-    let ws_dep_detailed_re =
-        regex::Regex::new(r#"(?m)^(\s*)([a-zA-Z0-9_-]+)\s*=\s*\{\s*workspace\s*=\s*true([^}]*)\}"#)
-            .unwrap();
-    patched = ws_dep_detailed_re
-        .replace_all(&patched, |caps: &regex::Captures| {
-            let indent = &caps[1];
-            let dep_name = &caps[2];
-            let extra_attrs = &caps[3];
-            // Check if this is one of our path dependencies
-            if all_path_deps.contains_key(dep_name) {
-                format!(
-                    "{}{} = {{ path = \"../{}\"{}}}",
-                    indent, dep_name, dep_name, extra_attrs
-                )
-            } else {
-                // Fall back to wildcard version
-                format!(
-                    "{}{} = {{ version = \"*\"{}}}",
-                    indent, dep_name, extra_attrs
-                )
-            }
-        })
-        .to_string();
-
-    // Convert path dependencies to use relative paths within deps/
-    // path = "../foo" -> path = "../foo"
-    let path_dep_re = regex::Regex::new(r#"path\s*=\s*"\.\./([\w-]+)""#).unwrap();
-    patched = path_dep_re
-        .replace_all(&patched, |caps: &regex::Captures| {
-            let dep_name = &caps[1];
-            format!("path = \"../{}\"", dep_name)
-        })
-        .to_string();
-
+    let patched = toml::to_string_pretty(&doc).context("Failed to serialize patched TOML")?;
     fs::write(cargo_toml_path, patched)?;
     Ok(())
 }
 
-/// Copy source files recursively, transforming crate references
-/// `crate_module_name` is the name of the module (e.g., "lsd") so we can transform
-/// `use crate::X` to `use crate::{module}::X`
-fn copy_source_files_with_transform(src: &Path, dst: &Path, crate_module_name: &str) -> Result<()> {
-    // First, scan the main source file for #[macro_export] macros
-    let main_rs = src.join("main.rs");
-    let exported_macros = if main_rs.exists() {
-        find_exported_macros(&fs::read_to_string(&main_rs).unwrap_or_default())
-    } else {
-        std::collections::HashSet::new()
+/// Check if a TOML value represents `{ workspace = true }` or `X.workspace = true`
+fn is_workspace_inherited(value: Option<&toml::Value>) -> bool {
+    match value {
+        Some(toml::Value::Table(t)) => t
+            .get("workspace")
+            .and_then(|v| v.as_bool())
+            .unwrap_or(false),
+        _ => false,
+    }
+}
+
+/// Collect all dependency section key paths (e.g., "dependencies", "dev-dependencies",
+/// "build-dependencies", "target.cfg(unix).dependencies", etc.)
+fn collect_dep_section_keys(doc: &toml::Value) -> Vec<String> {
+    let mut keys = Vec::new();
+    for section in ["dependencies", "dev-dependencies", "build-dependencies"] {
+        if doc.get(section).is_some() {
+            keys.push(section.to_string());
+        }
+    }
+
+    // Also check target-specific deps: [target."cfg(...)".dependencies]
+    if let Some(target) = doc.get("target").and_then(|v| v.as_table()) {
+        for (target_cfg, target_val) in target {
+            if let Some(target_table) = target_val.as_table() {
+                for section in ["dependencies", "dev-dependencies", "build-dependencies"] {
+                    if target_table.get(section).is_some() {
+                        keys.push(format!("target.{}.{}", target_cfg, section));
+                    }
+                }
+            }
+        }
+    }
+
+    keys
+}
+
+/// Navigate to a nested TOML table by dotted key path and return a mutable reference
+fn get_dep_table_mut<'a>(
+    doc: &'a mut toml::Value,
+    key_path: &str,
+) -> Option<&'a mut toml::map::Map<String, toml::Value>> {
+    let parts: Vec<&str> = key_path.splitn(3, '.').collect();
+    match parts.len() {
+        1 => doc.get_mut(parts[0]).and_then(|v| v.as_table_mut()),
+        3 => {
+            // target.<cfg>.dependencies
+            doc.get_mut(parts[0])
+                .and_then(|v| v.as_table_mut())
+                .and_then(|t| t.get_mut(parts[1]))
+                .and_then(|v| v.as_table_mut())
+                .and_then(|t| t.get_mut(parts[2]))
+                .and_then(|v| v.as_table_mut())
+        }
+        _ => None,
+    }
+}
+
+/// Patch a single dependency section to resolve workspace inheritance
+fn patch_dep_section(
+    doc: &mut toml::Value,
+    key_path: &str,
+    all_path_deps: &std::collections::BTreeMap<String, PathBuf>,
+) {
+    let Some(deps) = get_dep_table_mut(doc, key_path) else {
+        return;
     };
 
-    // Also collect renamed extern crates (extern crate X as Y)
-    // and package renames from dependencies
-    let dep_renames = find_dependency_renames(src);
+    let dep_names: Vec<String> = deps.keys().cloned().collect();
 
-    copy_source_files_recursive(src, dst, crate_module_name, &exported_macros, &dep_renames)
+    for dep_name in dep_names {
+        let dep_val = match deps.get(&dep_name) {
+            Some(v) => v.clone(),
+            None => continue,
+        };
+
+        if let Some(table) = dep_val.as_table() {
+            if table
+                .get("workspace")
+                .and_then(|v| v.as_bool())
+                .unwrap_or(false)
+            {
+                // This is a workspace-inherited dependency — resolve it
+                let mut new_table = toml::map::Map::new();
+
+                // Carry over non-workspace fields (features, optional, default-features, etc.)
+                for (k, v) in table {
+                    if k != "workspace" {
+                        new_table.insert(k.clone(), v.clone());
+                    }
+                }
+
+                // Resolve the actual package name: if the dep has a `package` field,
+                // that's the real crate name; otherwise the TOML key is the name.
+                let actual_pkg = table
+                    .get("package")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or(&dep_name);
+
+                // Set path or version
+                if all_path_deps.contains_key(actual_pkg) {
+                    new_table.insert(
+                        "path".to_string(),
+                        toml::Value::String(format!("../{}", actual_pkg)),
+                    );
+                } else {
+                    // Only add version = "*" if there's no version already
+                    if !new_table.contains_key("version") {
+                        new_table
+                            .insert("version".to_string(), toml::Value::String("*".to_string()));
+                    }
+                }
+
+                deps.insert(dep_name.clone(), toml::Value::Table(new_table));
+            } else if let Some(path_str) = table.get("path").and_then(|v| v.as_str()) {
+                // Non-workspace path dep — rewrite path to point within deps/
+                // Extract the final component (package name) from the path
+                let path_final = Path::new(path_str)
+                    .file_name()
+                    .and_then(|n| n.to_str())
+                    .unwrap_or(path_str);
+
+                if all_path_deps.contains_key(path_final) {
+                    let mut new_table = table.clone();
+                    new_table.insert(
+                        "path".to_string(),
+                        toml::Value::String(format!("../{}", path_final)),
+                    );
+                    deps.insert(dep_name.clone(), toml::Value::Table(new_table));
+                }
+            }
+        }
+    }
 }
 
 fn copy_source_files_recursive(
@@ -996,40 +1064,6 @@ fn transform_crate_references(
         .to_string();
 
     result
-}
-
-fn copy_cargo_config(dest_dir: &Path) -> Result<()> {
-    // Look for .cargo/config.toml in current directory or parent directories
-    let mut search_dir = std::env::current_dir()?;
-
-    loop {
-        let cargo_config = search_dir.join(".cargo").join("config.toml");
-        if cargo_config.exists() {
-            let dest_cargo_dir = dest_dir.join(".cargo");
-            fs::create_dir_all(&dest_cargo_dir)?;
-            fs::copy(&cargo_config, dest_cargo_dir.join("config.toml"))?;
-            return Ok(());
-        }
-
-        // Also check for config (without .toml extension)
-        let cargo_config_alt = search_dir.join(".cargo").join("config");
-        if cargo_config_alt.exists() {
-            let dest_cargo_dir = dest_dir.join(".cargo");
-            fs::create_dir_all(&dest_cargo_dir)?;
-            fs::copy(&cargo_config_alt, dest_cargo_dir.join("config"))?;
-            return Ok(());
-        }
-
-        // Move to parent directory
-        if let Some(parent) = search_dir.parent() {
-            search_dir = parent.to_path_buf();
-        } else {
-            break;
-        }
-    }
-
-    // No cargo config found, which is fine
-    Ok(())
 }
 
 fn find_runtime_path() -> Result<PathBuf> {

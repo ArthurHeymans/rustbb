@@ -3,16 +3,16 @@
 //! This crate provides the command registry and dispatch mechanism
 //! for combined multi-call binaries created by rustbb.
 
-use std::cell::RefCell;
 use std::collections::HashMap;
 use std::ffi::OsString;
 use std::path::Path;
+use std::sync::Mutex;
 
-// Thread-local storage for the effective arguments
-// This is set by the dispatcher before calling a command
-thread_local! {
-    static EFFECTIVE_ARGS: RefCell<Option<Vec<OsString>>> = const { RefCell::new(None) };
-}
+// Global storage for the effective arguments.
+// Using a Mutex so all threads (rayon, tokio, etc.) see the same args.
+// The previous thread_local RefCell approach silently fell back to
+// raw std::env::args() on spawned threads, producing wrong argv.
+static EFFECTIVE_ARGS: Mutex<Option<Vec<OsString>>> = Mutex::new(None);
 
 /// Returns an iterator over the arguments, with proper shifting for multi-call mode.
 ///
@@ -20,6 +20,7 @@ thread_local! {
 /// In symlink mode (`./cmd args...`), this returns `["cmd", "args", ...]`
 ///
 /// This is a drop-in replacement for `std::env::args()` that handles multi-call binaries correctly.
+/// Safe to call from any thread.
 pub fn args() -> impl Iterator<Item = String> {
     args_os().map(|s| s.to_string_lossy().into_owned())
 }
@@ -27,28 +28,36 @@ pub fn args() -> impl Iterator<Item = String> {
 /// Returns an iterator over the arguments as OsStrings.
 ///
 /// This is a drop-in replacement for `std::env::args_os()` that handles multi-call binaries correctly.
+/// Safe to call from any thread.
 pub fn args_os() -> impl Iterator<Item = OsString> {
-    EFFECTIVE_ARGS.with(|args| {
-        args.borrow()
-            .clone()
-            .unwrap_or_else(|| std::env::args_os().collect())
-            .into_iter()
-    })
+    let guard = EFFECTIVE_ARGS.lock().unwrap_or_else(|e| e.into_inner());
+    let args = guard
+        .clone()
+        .unwrap_or_else(|| std::env::args_os().collect());
+    args.into_iter()
 }
 
 /// Set the effective arguments for the current command.
 /// This is called by the dispatcher before invoking a command.
 fn set_effective_args(args: Vec<OsString>) {
-    EFFECTIVE_ARGS.with(|cell| {
-        *cell.borrow_mut() = Some(args);
-    });
+    let mut guard = EFFECTIVE_ARGS.lock().unwrap_or_else(|e| e.into_inner());
+    *guard = Some(args);
 }
 
 /// Clear the effective arguments after a command completes.
 fn clear_effective_args() {
-    EFFECTIVE_ARGS.with(|cell| {
-        *cell.borrow_mut() = None;
-    });
+    let mut guard = EFFECTIVE_ARGS.lock().unwrap_or_else(|e| e.into_inner());
+    *guard = None;
+}
+
+/// Drop guard that clears effective args when dropped.
+/// Ensures cleanup even if the command panics (and the panic is caught).
+struct ArgsGuard;
+
+impl Drop for ArgsGuard {
+    fn drop(&mut self) {
+        clear_effective_args();
+    }
 }
 
 /// Function signature for command entry points.
@@ -101,12 +110,12 @@ impl Registry {
     ///
     /// This sets up the effective arguments before calling the command,
     /// so that `rustbb_runtime::args()` returns the correct values.
+    /// The args are visible to all threads spawned by the command.
     pub fn try_run_with_args(&self, name: &str, args: Vec<OsString>) -> Option<i32> {
         self.commands.get(name).map(|cmd| {
             set_effective_args(args);
-            let result = cmd();
-            clear_effective_args();
-            result
+            let _guard = ArgsGuard; // clears args on drop, even if cmd() panics
+            cmd()
         })
     }
 }
@@ -247,5 +256,49 @@ mod tests {
 
         let list = registry.list();
         assert_eq!(list, vec!["alpha", "beta"]);
+    }
+
+    // Tests that touch global EFFECTIVE_ARGS must not run in parallel.
+    // We use a shared test mutex to serialize them.
+    static TEST_MUTEX: Mutex<()> = Mutex::new(());
+
+    #[test]
+    fn test_args_default_fallback() {
+        let _lock = TEST_MUTEX.lock().unwrap();
+        // When no effective args are set, args_os() should return std::env::args_os()
+        clear_effective_args();
+        let result: Vec<OsString> = args_os().collect();
+        let expected: Vec<OsString> = std::env::args_os().collect();
+        assert_eq!(result, expected);
+    }
+
+    #[test]
+    fn test_args_with_effective() {
+        let _lock = TEST_MUTEX.lock().unwrap();
+        let test_args = vec![
+            OsString::from("test-cmd"),
+            OsString::from("--flag"),
+            OsString::from("value"),
+        ];
+        set_effective_args(test_args.clone());
+        let result: Vec<OsString> = args_os().collect();
+        assert_eq!(result, test_args);
+        clear_effective_args();
+    }
+
+    #[test]
+    fn test_args_visible_from_thread() {
+        let _lock = TEST_MUTEX.lock().unwrap();
+        let test_args = vec![OsString::from("threaded-cmd"), OsString::from("arg1")];
+        set_effective_args(test_args.clone());
+
+        let handle = std::thread::spawn(|| {
+            let result: Vec<OsString> = args_os().collect();
+            result
+        });
+
+        let thread_result = handle.join().unwrap();
+        assert_eq!(thread_result, test_args);
+        clear_effective_args();
     }
 }

@@ -474,19 +474,26 @@ fn resolve_features(
     resolved.into_iter().collect()
 }
 
-/// Check if source code has internal `mod` declarations (not `mod name;` but actual modules)
+/// Check if source code has external `mod name;` declarations.
+/// These indicate the crate has separate .rs files that need to be copied.
+///
+/// Uses syn AST parsing instead of regex to avoid false positives on
+/// `mod` in comments, strings, or doc attributes.
 fn has_mod_declarations(source: &str) -> bool {
-    // Look for `mod name;` patterns (external module declarations)
-    // These indicate the crate has separate .rs files that need to be copied
-    let mod_pattern = Regex::new(r"(?m)^mod\s+[a-zA-Z_][a-zA-Z0-9_]*\s*;").unwrap();
-    mod_pattern.is_match(source)
+    let Ok(file) = parse_file(source) else {
+        return false;
+    };
+
+    file.items.iter().any(|item| {
+        // Item::Mod with content == None means `mod name;` (external file reference)
+        // Item::Mod with content == Some(...) means `mod name { ... }` (inline module)
+        matches!(item, Item::Mod(m) if m.content.is_none())
+    })
 }
 
 /// Evaluate if a cfg expression applies to the current platform
 /// Handles common patterns like cfg(unix), cfg(windows), cfg(target_os = "linux"), etc.
 fn cfg_matches_current_platform(cfg_str: &str) -> bool {
-    let cfg_lower = cfg_str.to_lowercase();
-
     // Parse out the cfg expression
     // Handle both `cfg(...)` and `'cfg(...)'` formats
     let cfg_content = if let Some(inner) = cfg_str
@@ -977,7 +984,7 @@ pub fn run_build_script(crate_path: &Path, crate_name: &str) -> Result<BTreeMap<
 
     // Copy .cargo/config.toml if it exists in the current directory or parents
     // This is needed for NixOS and other environments with custom linker settings
-    copy_cargo_config_to(crate_path)?;
+    crate::util::copy_cargo_config(crate_path)?;
 
     // Run cargo build to trigger the build script
     let output = Command::new("cargo")
@@ -1069,40 +1076,6 @@ fn collect_rs_files(base: &Path, dir: &Path, outputs: &mut BTreeMap<String, Stri
         }
     }
 
-    Ok(())
-}
-
-/// Copy .cargo/config.toml from current directory or parents to a target directory
-fn copy_cargo_config_to(dest_dir: &Path) -> Result<()> {
-    let mut search_dir = std::env::current_dir()?;
-
-    loop {
-        let cargo_config = search_dir.join(".cargo").join("config.toml");
-        if cargo_config.exists() {
-            let dest_cargo_dir = dest_dir.join(".cargo");
-            fs::create_dir_all(&dest_cargo_dir)?;
-            fs::copy(&cargo_config, dest_cargo_dir.join("config.toml"))?;
-            return Ok(());
-        }
-
-        // Also check for config (without .toml extension)
-        let cargo_config_alt = search_dir.join(".cargo").join("config");
-        if cargo_config_alt.exists() {
-            let dest_cargo_dir = dest_dir.join(".cargo");
-            fs::create_dir_all(&dest_cargo_dir)?;
-            fs::copy(&cargo_config_alt, dest_cargo_dir.join("config"))?;
-            return Ok(());
-        }
-
-        // Move to parent directory
-        if let Some(parent) = search_dir.parent() {
-            search_dir = parent.to_path_buf();
-        } else {
-            break;
-        }
-    }
-
-    // No cargo config found, which is fine
     Ok(())
 }
 

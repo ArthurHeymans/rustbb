@@ -7,6 +7,7 @@ mod codegen;
 mod discovery;
 mod fetch;
 mod transform;
+mod util;
 
 use fetch::{CrateSource, FetchedCrate};
 
