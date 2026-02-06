@@ -205,7 +205,7 @@ pub fn build(
             }
             TransformStrategy::UucoreBinMacro { crate_name } => {
                 // For uucore::bin! macro, we generate a wrapper that calls the library's uumain
-                let wrapper_source = generate_uucore_wrapper(&crate_name, &info.name);
+                let wrapper_source = generate_uucore_wrapper(crate_name, &info.name);
                 transformed.insert(info.name.clone(), wrapper_source);
                 println!("  ✓ {} (uucore)", info.name);
             }

@@ -370,7 +370,7 @@ fn looks_like_multicall_dispatch(content: &str) -> bool {
 }
 
 pub fn sanitize_name(name: &str) -> String {
-    name.replace('-', "_").replace('.', "_").to_lowercase()
+    name.replace(['-', '.'], "_").to_lowercase()
 }
 
 #[cfg(test)]
