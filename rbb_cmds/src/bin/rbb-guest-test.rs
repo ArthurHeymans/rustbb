@@ -194,7 +194,13 @@ fn verify() -> io::Result<()> {
         "sorted ls",
     )?;
     applet("rm", &["/tmp/a/moved"])?;
-    check(applet("uname", &["-a"])?.contains("Linux"), "uname")?;
+    let uname = applet("uname", &["-a"])?;
+    check(
+        uname.starts_with("Linux ")
+            && uname.split_whitespace().last() == Some(std::env::consts::ARCH),
+        "kernel / guest architecture mismatch",
+    )?;
+    println!("RBB_GUEST_ARCH={}", std::env::consts::ARCH);
     check(applet("free", &[])?.contains("MemTotal:"), "free")?;
     check(
         applet("ps", &[])?.contains("\n1\tinit\t"),

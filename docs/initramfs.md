@@ -15,8 +15,9 @@ needed to build an image. A Linux kernel is supplied separately.
 
 ## Build and boot
 
-Requirements: stable Rust, installed musl target, an x86_64 Linux `bzImage`, and
-`qemu-system-x86_64` (TCG works without KVM/root). Python 3 is needed for the tests.
+Requirements: stable Rust, an installed musl target, and a matching Linux kernel
+and QEMU system emulator. x86_64 and arm64 are tested with TCG (no KVM/root
+needed). Python 3 is needed for the tests.
 
 From the workspace root:
 
@@ -54,14 +55,34 @@ cargo run -p rbb-mkimage -- \
 `--busybox` means the **rbb** multicall executable, not an arbitrary BusyBox.
 Include additional static Rust tools (including separately built `rustbb`
 multicalls) with `--file tool:/bin/tool`. ELF64 little-endian guest binaries are
-supported by the packager; architecture must match the kernel. Only x86_64 has
-been tested here. Files added with `--file` are not automatically static-checked;
-include their interpreters/libraries yourself if they need any.
+supported by the packager; architecture must match the kernel. x86_64 and arm64
+have both been boot-tested. Files added with `--file` are not automatically
+static-checked; include their interpreters/libraries yourself if they need any.
 
 Kernel requirements include built-in initramfs support, ELF binaries, procfs,
 sysfs, devtmpfs, tmpfs, devpts, Unix datagram sockets, signalfd, serial console,
 and gzip decompression for compressed images. Device drivers needed at boot must
 be built in or supplied as modules. The tests use no disks or networking.
+
+### arm64
+
+```sh
+rustup target add aarch64-unknown-linux-musl
+python3 scripts/test-qemu.py --arch arm64 --kernel /path/to/arm64/Image
+```
+
+The harness cross-links using Rust's bundled `rust-lld`, boots QEMU's `virt`
+machine with Cortex-A72 CPUs, uses the PL011 console (`ttyAMA0`), and checks ELF
+machine type and guest `uname`. No aarch64 host userspace or cross C compiler is
+required. Raw Linux Images and EFI gzip-zboot kernels are accepted; the harness
+extracts zboot's Linux Image for QEMU direct boot. It does not test UEFI boot.
+
+For a standalone image, use `rbb-mkimage --build --target
+aarch64-unknown-linux-musl` and `qemu-system-aarch64 -machine virt -cpu cortex-a72
+-m 256M -kernel Image -initrd IMAGE.cpio.gz -append 'console=ttyAMA0 rdinit=/init'
+-nographic -no-reboot -nic none`. With Nix's host linker wrappers, set
+`CARGO_TARGET_AARCH64_UNKNOWN_LINUX_MUSL_LINKER` to the same host `rust-lld` path
+shown above for x86_64.
 
 ## Services
 
@@ -159,8 +180,10 @@ binary/file bytes; Rust compiler path/toolchain differences may change binaries.
 
 ```sh
 cargo test --workspace
+python3 -m unittest discover -s scripts -p 'test_*.py'
 cargo clippy -p rbb-init -p rbb-cmds -p rbb-mkimage --all-targets -- -D warnings
-python3 scripts/test-qemu.py --kernel /path/to/bzImage
+python3 scripts/test-qemu.py --arch x86_64 --kernel /path/to/bzImage
+python3 scripts/test-qemu.py --arch arm64 --kernel /path/to/arm64/Image
 # NixOS default: --kernel /run/current-system/kernel; or set RBB_KERNEL
 ```
 
@@ -172,8 +195,18 @@ failure, restart policies, up/down/restart, adopted orphan reaping, file and
 mount applets, and TERM-to-KILL escalation. The host requires guest pass markers,
 completed shutdown, successful QEMU exit and no panic. A third boot builds the
 default rescue image through `--build`, waits for its serial console prompt,
-runs `echo` and `ctl status`, then powers it off. Logs/images are retained in
-`target/qemu-tests/` (or under `CARGO_TARGET_DIR`).
+runs `echo`, `uname` and `ctl status`, then powers it off. Logs/images are retained
+separately in `target/qemu-tests/x86_64/` and `target/qemu-tests/arm64/` (or under
+`CARGO_TARGET_DIR`). Both architectures run the same guest tests.
+
+Validated with Rust 1.99.0 and QEMU 11.1.2, x86_64 Linux 7.3 and arm64 Alpine
+Linux 6.18.58-0-virt. The arm64 kernel came from
+<https://dl-cdn.alpinelinux.org/alpine/v3.23/releases/aarch64/netboot/vmlinuz-virt>
+and had SHA-256
+`d1876369b061ef3bc33314f490240efcd32b031393cb34c6f81134fa862fe472`.
+That URL is updated by Alpine; retain/check the hash when reproducing these
+exact results. These tests cover initramfs boot and supervision, **not disk-root
+handoff, kexec, netboot or physical arm64 boards**, which are future work.
 
 ## Alternatives and next steps
 
