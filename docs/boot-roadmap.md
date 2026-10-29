@@ -19,12 +19,17 @@ Implemented milestones:
 - [Target ELF command manifests, alias presets and bounded base CPIO merging](image-builder.md),
   original-init preservation and generated shell/uinit selection (4 cases per architecture).
 
-**Not yet implemented:** D's richer uutils/brush userland and
-readiness/hooks/log routing/privilege dropping; C's
+- [Optional uutils/brush rescue builds](rescue-userland.md), with POSIX companion
+  utilities, feature-aware aliases, minimal fallback and real interactive console
+  tests (2 cases per architecture). Small builds exclude these optional dependencies.
+
+**Not yet implemented:** D's readiness/hooks/log routing/privilege dropping and
+additional grep/find/archive tools; C's
 DHCPv6/SLAAC integration, IPv6 E2E tests and ordered multi-source boot policy;
 A's automatic uevent/module handling, softdeps and zstd modules. Classic kexec,
 custom DTB replacement and the optional extensions remain outside this increment.
-The existing shell is still the explicitly minimal interpreter, not POSIX/Bash.
+The small build's shell remains the explicitly minimal interpreter; richer builds
+reuse brush rather than claiming that the tiny interpreter implements POSIX/Bash.
 
 ## What was inspected
 
@@ -156,8 +161,8 @@ with `python3 scripts/generate-notices.py` after dependency changes.
 
 | Area | Candidate | Decision / remaining work |
 |---|---|---|
-| General utilities | [`uu_*`, `uucore` 0.12.0](https://github.com/uutils/coreutils), MIT | Reuse selected command libraries/APIs, not a second full coreutils binary. Check each feature's libc/native requirements and size. |
-| Real shell | [`brush-core` 0.5.0 / `brush-shell` 0.4.0](https://github.com/reubeno/brush), MIT | Stronger choice than writing another shell; evaluate API integration, serial terminal behavior, dependencies and size. |
+| General utilities | [`uu_*`, `uucore` 0.12.0](https://github.com/uutils/coreutils), MIT | Adopted selected uu_* APIs as an optional feature, not a second coreutils binary. Small builds exclude them; static musl guest tests cover richer file/text/device/hash/timeout behavior on both targets. Native ACL/SELinux/OpenSSL options remain disabled. |
+| Real shell | [`brush-core` 0.5.0 / `brush-shell` 0.4.0](https://github.com/reubeno/brush), MIT | Adopted brush-shell's public entry plus brush-core's option parser, with exec-self argv/default-backend normalization and sh-mode companion utilities. Real serial-console and scripting tests pass on both architectures; minish is the explicit fallback. |
 | Linux syscall wrappers | [`nix` 0.31.3](https://docs.rs/nix/0.31.3/nix/), MIT | Reuse mount, exec, signals and process primitives where practical; keep narrow audited unsafe wrappers only for gaps. |
 | Link/address/route configuration | [`rtnetlink` 0.23.0](https://docs.rs/rtnetlink/0.23.0/rtnetlink/), MIT | Reuse packet/transport machinery, with a per-command runtime if needed; don't implement netlink framing ourselves. |
 | DHCP client | [`mozim` 0.3.3](https://docs.rs/mozim/0.3.3/mozim/), Apache-2.0 | Adopted for v4 with a small Apache-2.0 vendor patch exposing BOOTP fields, option overload and client boot options; wire tests and dual-architecture guest boots pass. See vendor/mozim/RBB_PATCHES.md. V6 integration remains pending. |

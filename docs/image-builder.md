@@ -20,10 +20,13 @@ Presets select installed aliases:
 
 `--commands init,ctl,sh,echo,poweroff` explicitly selects aliases instead of a
 preset; unavailable, duplicate or unsafe names are rejected. Init is mandatory.
-The installed selection is recorded at `/etc/rbb/commands.json`. This controls
+For a rich binary, selecting `sh` also installs its required `printf`, `test` and
+`[` companions. The installed selection is recorded at `/etc/rbb/commands.json`. This controls
 aliases, **not security or code stripping**: invoking an unaliased compiled command
 via `/bbin/rbb` is still possible. Optional compile features, not alias removal,
-control whether optional dependencies are linked into a binary.
+control whether optional dependencies are linked into a binary. With `--build`,
+rescue defaults to `rescue-tools`; other presets default to the small build.
+`--build-features` overrides this choice; see [richer userland](rescue-userland.md).
 
 ## Merge bases and preserve init
 

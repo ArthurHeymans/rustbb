@@ -1,6 +1,12 @@
 mod boot;
+#[cfg(feature = "brush")]
+mod brush;
+#[cfg(feature = "coreutils")]
+mod coreutils;
 mod net;
 mod shell;
+#[cfg(any(feature = "coreutils", feature = "brush"))]
+mod utility;
 
 use std::ffi::CString;
 use std::fs;
@@ -9,7 +15,6 @@ use std::os::unix::fs::{symlink, PermissionsExt};
 use std::path::Path;
 use std::time::Duration;
 
-pub use rbb_manifest::APPLETS;
 include!(concat!(env!("OUT_DIR"), "/commands.rs"));
 
 fn invalid(message: &str) -> io::Error {
@@ -72,6 +77,19 @@ pub fn entry(mut args: Vec<String>) -> i32 {
 }
 
 pub fn run(name: &str, args: &[String]) -> io::Result<i32> {
+    #[cfg(feature = "coreutils")]
+    if let Some(code) = coreutils::run(name, args)? {
+        return Ok(code);
+    }
+    #[cfg(all(feature = "brush", not(feature = "coreutils")))]
+    if matches!(name, "printf" | "test" | "[") {
+        let args = utility::args(name, args)?;
+        return Ok(if name == "printf" {
+            uu_printf::uumain(args)
+        } else {
+            uu_test::uumain(args)
+        });
+    }
     match name {
         "ip" => rbb_boot::network::ip(args)?,
         "dhclient" => net::dhclient(args)?,
@@ -81,6 +99,11 @@ pub fn run(name: &str, args: &[String]) -> io::Result<i32> {
         "kexec" => boot::kexec(args)?,
         "true" => {}
         "false" => return Ok(1),
+        #[cfg(feature = "brush")]
+        "sh" | "brush" => return brush::run(args, name == "sh"),
+        #[cfg(feature = "brush")]
+        "minish" => return shell::run(args),
+        #[cfg(not(feature = "brush"))]
         "sh" => return shell::run(args),
         "echo" => {
             let (newline, words) = if args.first().is_some_and(|a| a == "-n") {

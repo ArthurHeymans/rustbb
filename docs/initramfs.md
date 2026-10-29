@@ -1,11 +1,12 @@
 # Rust initramfs toolkit
 
-This workspace has four companion crates for `rustbb`:
+This workspace has five companion crates for `rustbb`:
 
 - **rbb-init**: Linux PID 1 and foreground service supervisor; also usable as an
   unprivileged host supervisor (`--supervise`).
 - **rbb-cmds**: a statically linkable multicall rescue userland, binary `rbb`.
 - **rbb-mkimage**: deterministic `newc` CPIO image builder, optionally gzip-compressed.
+- **rbb-manifest**: shared, versioned target command inventory for feature-aware packaging.
 - **rbb-boot**: device/module discovery, [disk-root handoff](disk-boot.md), and
   [local Linux kernel boot](kernel-boot.md), and [network boot](network-boot.md).
 
@@ -34,7 +35,10 @@ qemu-system-x86_64 -m 256M -kernel /path/to/bzImage \
 The default image boots a console command interpreter. Try `ctl status`, `ls /`,
 `ps`, `mount`, `free`, then `poweroff`. QEMU's `Ctrl-a x` terminates the VM.
 This rescue console is **unauthenticated**, deliberately. Do not expose it to
-untrusted users. Built-in commands are intentionally small, not GNU-compatible.
+untrusted users. The small build's commands are intentionally limited. The default
+`--build --preset rescue` enables optional [uutils and brush](rescue-userland.md);
+`--build --preset minimal` excludes those dependencies. A prebuilt binary's
+features cannot be changed by selecting different aliases.
 
 On NixOS, if the host C linker injects its own loader, use Rust's bundled linker:
 

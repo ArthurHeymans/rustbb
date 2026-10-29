@@ -12,7 +12,7 @@ ROOT = Path(__file__).resolve().parents[1]
 
 def generate():
     try:
-        metadata = json.loads(subprocess.check_output(["cargo", "metadata", "--format-version=1", "--locked"], cwd=ROOT))
+        metadata = json.loads(subprocess.check_output(["cargo", "metadata", "--format-version=1", "--locked", "--all-features"], cwd=ROOT))
     except (ValueError, OSError, subprocess.SubprocessError) as error:
         raise RuntimeError("could not read locked Cargo metadata") from error
     lock = tomllib.loads((ROOT / "Cargo.lock").read_text())

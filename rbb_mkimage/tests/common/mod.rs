@@ -1,10 +1,11 @@
 // Structural ELF64 fixture with a target inventory; never executed as a guest.
 pub fn elf() -> Vec<u8> {
+    elf_for_manifest(rbb_manifest::Manifest::current("x86_64-unknown-linux-musl"))
+}
+
+pub fn elf_for_manifest(manifest: rbb_manifest::Manifest) -> Vec<u8> {
     let names = b"\0.shstrtab\0.rbb.commands\0";
-    let inventory = serde_json::to_vec(&rbb_manifest::Manifest::current(
-        "x86_64-unknown-linux-musl",
-    ))
-    .unwrap();
+    let inventory = serde_json::to_vec(&manifest).unwrap();
     let mut data = vec![0; 312 + names.len() + inventory.len()];
     data[..7].copy_from_slice(b"\x7fELF\x02\x01\x01");
     data[16] = 2;

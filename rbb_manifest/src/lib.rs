@@ -4,6 +4,29 @@ use std::collections::BTreeSet;
 use std::io;
 
 pub const SECTION: &str = ".rbb.commands";
+pub const COREUTILS_EXTRA: &[&str] = &[
+    "head",
+    "tail",
+    "wc",
+    "cut",
+    "sort",
+    "uniq",
+    "tee",
+    "tr",
+    "env",
+    "printenv",
+    "mktemp",
+    "timeout",
+    "dd",
+    "sync",
+    "mknod",
+    "mkfifo",
+    "touch",
+    "sha256sum",
+    "printf",
+    "test",
+    "[",
+];
 pub const APPLETS: &[&str] = &[
     "init", "ctl", "sh", "echo", "cat", "ls", "mkdir", "cp", "mv", "rm", "ln", "readlink", "chmod",
     "pwd", "sleep", "true", "false", "uname", "mount", "umount", "insmod", "dmesg", "ps", "free",
@@ -31,6 +54,23 @@ impl Manifest {
             commands: APPLETS.iter().map(|s| (*s).into()).collect(),
         }
     }
+    pub fn with_tools(target: &str, coreutils: bool, brush: bool) -> Self {
+        let mut value = Self::current(target);
+        if coreutils {
+            value
+                .commands
+                .extend(COREUTILS_EXTRA.iter().map(|s| (*s).into()));
+        }
+        if brush {
+            if !coreutils {
+                value
+                    .commands
+                    .extend(["printf".into(), "test".into(), "[".into()]);
+            }
+            value.commands.extend(["brush".into(), "minish".into()]);
+        }
+        value
+    }
     pub fn parse(bytes: &[u8]) -> io::Result<Self> {
         if bytes.len() > 64 * 1024 {
             return Err(invalid("command manifest exceeds 64KiB"));
@@ -52,9 +92,10 @@ impl Manifest {
         for name in &self.commands {
             if name.is_empty()
                 || name.len() > 64
-                || !name
-                    .bytes()
-                    .all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || b == b'-' || b == b'_')
+                || (name != "["
+                    && !name.bytes().all(|b| {
+                        b.is_ascii_lowercase() || b.is_ascii_digit() || b == b'-' || b == b'_'
+                    }))
                 || name == "rbb"
                 || !seen.insert(name)
             {
@@ -79,13 +120,20 @@ impl Manifest {
             "rescue" => &[],
             _ => return Err(invalid("unknown image preset")),
         };
-        let selected = if !explicit.is_empty() {
+        let mut selected = if !explicit.is_empty() {
             explicit.to_vec()
         } else if preset == "rescue" {
             self.commands.clone()
         } else {
             base.iter().chain(extras).map(|s| (*s).into()).collect()
         };
+        if self.commands.iter().any(|n| n == "brush") && selected.iter().any(|n| n == "sh") {
+            for name in ["printf", "test", "["] {
+                if !selected.iter().any(|n| n == name) {
+                    selected.push(name.into());
+                }
+            }
+        }
         let mut seen = BTreeSet::new();
         for name in &selected {
             if !self.commands.contains(name) || !seen.insert(name) {

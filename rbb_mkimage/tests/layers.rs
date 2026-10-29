@@ -37,6 +37,52 @@ fn manifest_target_and_missing_inventory_fail_closed() {
 }
 
 #[test]
+fn generated_console_uses_target_features_and_retains_startup_service() {
+    let dir = tempfile::tempdir().unwrap();
+    for rich in [false, true] {
+        let binary = dir.path().join("rbb");
+        fs::write(
+            &binary,
+            common::elf_for_manifest(rbb_manifest::Manifest::with_tools(
+                "x86_64-unknown-linux-musl",
+                rich,
+                rich,
+            )),
+        )
+        .unwrap();
+        let output = dir.path().join("out");
+        assert!(Command::new(env!("CARGO_BIN_EXE_rbb-mkimage"))
+            .arg("--busybox")
+            .arg(&binary)
+            .args(["--compress", "none"])
+            .arg("-o")
+            .arg(&output)
+            .status()
+            .unwrap()
+            .success());
+        let image = Image::read_archive(&fs::read(output).unwrap(), Conflict::Error).unwrap();
+        let config = rbb_init::config::Config::parse(
+            std::str::from_utf8(&image.entries["etc/rbb/init.toml"].data).unwrap(),
+        )
+        .unwrap();
+        let console = config
+            .services
+            .iter()
+            .find(|s| s.name == "console")
+            .unwrap();
+        assert_eq!(
+            console.command[0],
+            if rich { "/bin/brush" } else { "/bin/sh" }
+        );
+        assert_eq!(console.after, ["hello"]);
+        assert!(config
+            .services
+            .iter()
+            .any(|s| s.name == "hello" && s.kind == rbb_init::config::Kind::Oneshot));
+    }
+}
+
+#[test]
 fn explicit_commands_and_failed_merge_preserve_output() {
     let dir = tempfile::tempdir().unwrap();
     let binary = dir.path().join("rbb");

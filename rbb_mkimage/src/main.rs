@@ -1,3 +1,4 @@
+mod toolchain;
 use clap::{Parser, ValueEnum};
 use rbb_mkimage::{command_manifest, preset_image, Conflict, Entry, Image};
 use std::fs;
@@ -21,6 +22,9 @@ struct Args {
     busybox: Option<PathBuf>,
     #[arg(long)]
     build: bool,
+    /// Cargo features for --build (rescue defaults to rescue-tools; others to none)
+    #[arg(long, requires = "build")]
+    build_features: Option<String>,
     #[arg(long, default_value = ".")]
     workspace: PathBuf,
     #[arg(long, default_value = "x86_64-unknown-linux-musl")]
@@ -57,20 +61,24 @@ struct Args {
     compress: Compression,
 }
 
-fn build(target: &str, workspace: &Path) -> io::Result<PathBuf> {
-    let output = Command::new("cargo")
-        .current_dir(workspace)
-        .args([
-            "build",
-            "--release",
-            "-p",
-            "rbb-cmds",
-            "--bin",
-            "rbb",
-            "--target",
-            target,
-            "--message-format=json-render-diagnostics",
-        ])
+fn build(target: &str, workspace: &Path, features: &str) -> io::Result<PathBuf> {
+    let mut command = Command::new("cargo");
+    toolchain::configure(&mut command, target)?;
+    command.current_dir(workspace).args([
+        "build",
+        "--release",
+        "-p",
+        "rbb-cmds",
+        "--bin",
+        "rbb",
+        "--target",
+        target,
+        "--message-format=json-render-diagnostics",
+    ]);
+    if !features.is_empty() {
+        command.args(["--features", features]);
+    }
+    let output = command
         .stdout(Stdio::piped())
         .stderr(Stdio::inherit())
         .output()?;
@@ -118,7 +126,17 @@ fn executable(image: &Image, path: &str) -> io::Result<()> {
 fn main() -> io::Result<()> {
     let args = Args::parse();
     let binary = if args.build {
-        build(&args.target, &args.workspace)?
+        build(
+            &args.target,
+            &args.workspace,
+            args.build_features
+                .as_deref()
+                .unwrap_or(if args.preset == "rescue" {
+                    "rescue-tools"
+                } else {
+                    ""
+                }),
+        )?
     } else {
         args.busybox.unwrap()
     };
@@ -169,7 +187,12 @@ fn main() -> io::Result<()> {
         ));
     }
     if !image.entries.contains_key("etc/rbb/init.toml") {
-        let shell = args.shell.as_deref().unwrap_or("/bin/sh");
+        let default_shell = if image.entries.contains_key("bin/brush") {
+            "/bin/brush"
+        } else {
+            "/bin/sh"
+        };
+        let shell = args.shell.as_deref().unwrap_or(default_shell);
         executable(&image, shell)?;
         let mut text = String::new();
         if let Some(uinit) = args.uinit.as_deref() {
@@ -179,11 +202,13 @@ fn main() -> io::Result<()> {
                 serde_json::to_string(uinit)?
             );
         }
-        text += "[[services]]\nname = 'console'\n";
-        text += &format!("command = [{}]\n", serde_json::to_string(shell)?);
+        executable(&image, "/bin/echo")?;
+        text += "[[services]]\nname = 'hello'\nkind = 'oneshot'\ncommand = ['/bin/echo', 'Rust initramfs ready. Use ctl status, poweroff, or reboot.']\n";
         if args.uinit.is_some() {
             text += "after = ['uinit']\n";
         }
+        text += "\n[[services]]\nname = 'console'\nafter = ['hello']\n";
+        text += &format!("command = [{}]\n", serde_json::to_string(shell)?);
         image.insert("etc/rbb/init.toml", Entry::file(text.into_bytes(), 0o644))?;
     } else if args.shell.is_some() || args.uinit.is_some() {
         return Err(io::Error::other(
