@@ -1,0 +1,57 @@
+shutdown_timeout_ms = 400
+
+[[services]]
+name = "setup"
+kind = "oneshot"
+command = ["/bin/guest-test", "setup"]
+cwd = "/tmp"
+env = { RBB_TEST = "works" }
+
+[[services]]
+name = "crash"
+command = ["/bin/guest-test", "crash"]
+after = ["setup"]
+restart_delay_ms = 100
+
+[[services]]
+name = "retry"
+kind = "oneshot"
+restart = "on-failure"
+command = ["/bin/guest-test", "retry"]
+restart_delay_ms = 100
+
+[[services]]
+name = "orphan"
+kind = "oneshot"
+command = ["/bin/guest-test", "orphan"]
+
+[[services]]
+name = "failure"
+kind = "oneshot"
+command = ["/bin/false"]
+
+[[services]]
+name = "blocked"
+command = ["/bin/guest-test", "should-not-run"]
+after = ["failure"]
+
+[[services]]
+name = "missing"
+command = ["/does-not-exist"]
+restart = "never"
+
+[[services]]
+name = "disabled"
+command = ["/bin/guest-test", "should-not-run"]
+disabled = true
+
+[[services]]
+name = "stubborn"
+command = ["/bin/guest-test", "stubborn"]
+restart_delay_ms = 100
+
+[[services]]
+name = "verify"
+kind = "oneshot"
+command = ["/bin/guest-test", "verify"]
+after = ["setup", "crash", "retry", "orphan", "stubborn"]
