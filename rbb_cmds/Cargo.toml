@@ -14,5 +14,11 @@ libc = "0.2"
 rbb-init = { path = "../rbb_init" }
 rbb-boot = { path = "../rbb_boot" }
 
+rbb-manifest = { path = "../rbb_manifest" }
+
+[build-dependencies]
+rbb-manifest = { path = "../rbb_manifest" }
+serde_json = "1"
+
 [dev-dependencies]
 tempfile = "3"

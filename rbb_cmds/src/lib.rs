@@ -9,12 +9,8 @@ use std::os::unix::fs::{symlink, PermissionsExt};
 use std::path::Path;
 use std::time::Duration;
 
-pub const APPLETS: &[&str] = &[
-    "init", "ctl", "sh", "echo", "cat", "ls", "mkdir", "cp", "mv", "rm", "ln", "readlink", "chmod",
-    "pwd", "sleep", "true", "false", "uname", "mount", "umount", "insmod", "dmesg", "ps", "free",
-    "kill", "poweroff", "reboot", "modprobe", "lsmod", "rmmod", "blkid", "boot", "kexec", "ip",
-    "dhclient", "pxeboot", "wget",
-];
+pub use rbb_manifest::APPLETS;
+include!(concat!(env!("OUT_DIR"), "/commands.rs"));
 
 fn invalid(message: &str) -> io::Error {
     io::Error::new(io::ErrorKind::InvalidInput, message)
@@ -38,6 +34,8 @@ fn exact(args: &[String], n: usize, usage: &str) -> io::Result<()> {
 }
 
 pub fn entry(mut args: Vec<String>) -> i32 {
+    // Retain the allocated inventory section through LTO and linker GC/strip.
+    std::hint::black_box(&COMMAND_MANIFEST);
     if args.is_empty() {
         return 1;
     }

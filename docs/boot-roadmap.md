@@ -16,8 +16,11 @@ Implemented milestones:
 - Repeated deterministic image builds, pinned-source test kernels with fixed build
   identity/time, and bad-hash/signature/TLS/download/DHCP-timeout rescue tests.
 
-**Not yet implemented:** D's presets/command manifest, base CPIO merging, richer
-uutils/brush userland and readiness/hooks/log routing/privilege dropping; C's
+- [Target ELF command manifests, alias presets and bounded base CPIO merging](image-builder.md),
+  original-init preservation and generated shell/uinit selection (4 cases per architecture).
+
+**Not yet implemented:** D's richer uutils/brush userland and
+readiness/hooks/log routing/privilege dropping; C's
 DHCPv6/SLAAC integration, IPv6 E2E tests and ordered multi-source boot policy;
 A's automatic uevent/module handling, softdeps and zstd modules. Classic kexec,
 custom DTB replacement and the optional extensions remain outside this increment.

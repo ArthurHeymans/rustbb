@@ -1,4 +1,9 @@
-use std::collections::BTreeMap;
+mod archive;
+mod inventory;
+pub use archive::{Conflict, MAX_ARCHIVE_BYTES};
+pub use inventory::command_manifest;
+
+use std::collections::{BTreeMap, BTreeSet};
 use std::fs;
 use std::io::{self, Write};
 use std::os::unix::ffi::OsStrExt;
@@ -10,6 +15,8 @@ pub struct Entry {
     pub mode: u32,
     pub data: Vec<u8>,
     pub device: (u32, u32),
+    pub uid: u32,
+    pub gid: u32,
 }
 impl Entry {
     pub fn file(data: Vec<u8>, mode: u32) -> Self {
@@ -17,13 +24,17 @@ impl Entry {
             mode: 0o100000 | (mode & 0o777),
             data,
             device: (0, 0),
+            uid: 0,
+            gid: 0,
         }
     }
     pub fn directory(mode: u32) -> Self {
         Self {
-            mode: 0o040000 | mode,
+            mode: 0o040000 | (mode & 0o7777),
             data: Vec::new(),
             device: (0, 0),
+            uid: 0,
+            gid: 0,
         }
     }
     pub fn link(target: &str) -> Self {
@@ -31,13 +42,17 @@ impl Entry {
             mode: 0o120777,
             data: target.as_bytes().to_vec(),
             device: (0, 0),
+            uid: 0,
+            gid: 0,
         }
     }
 }
 
-#[derive(Default)]
+#[derive(Clone, Default)]
 pub struct Image {
     pub entries: BTreeMap<String, Entry>,
+    // Implicit parents must not overwrite an existing layer's directory metadata.
+    pub(crate) implicit_dirs: BTreeSet<String>,
 }
 
 fn invalid(message: impl Into<String>) -> io::Error {
@@ -75,11 +90,15 @@ impl Image {
                 }
             } else {
                 self.entries.insert(name.into(), Entry::directory(0o755));
+                self.implicit_dirs.insert(name.into());
             }
             parent = p.parent();
         }
         if let Some(existing) = self.entries.get(&path) {
             if existing.mode & 0o170000 == 0o040000 && entry.mode & 0o170000 == 0o040000 {
+                if self.implicit_dirs.remove(&path) {
+                    self.entries.insert(path, entry);
+                }
                 return Ok(());
             }
             return Err(invalid(format!("duplicate archive path: {path}")));
@@ -122,6 +141,8 @@ impl Image {
                     mode: 0o120777,
                     data: target.as_os_str().as_bytes().to_vec(),
                     device: (0, 0),
+                    uid: 0,
+                    gid: 0,
                 },
             )?;
         } else if kind.is_file() {
@@ -160,7 +181,7 @@ fn record(output: &mut impl Write, name: &str, entry: &Entry, inode: u32) -> io:
     let name_size = u32::try_from(name.len() + 1).map_err(io::Error::other)?;
     // ino, mode, uid, gid, nlink, mtime, filesize, devmajor/minor, rdevmajor/minor, namesize, check.
     write!(output, "070701{inode:08x}{:08x}{:08x}{:08x}{:08x}{:08x}{size:08x}{:08x}{:08x}{:08x}{:08x}{name_size:08x}{:08x}",
-        entry.mode, 0, 0, if entry.mode & 0o170000 == 0o040000 { 2 } else { 1 }, 0, 0, 0, entry.device.0, entry.device.1, 0)?;
+        entry.mode, entry.uid, entry.gid, if entry.mode & 0o170000 == 0o040000 { 2 } else { 1 }, 0, 0, 0, entry.device.0, entry.device.1, 0)?;
     output.write_all(name.as_bytes())?;
     output.write_all(&[0])?;
     let name_pad = (4 - (110 + name_size as usize) % 4) % 4;
@@ -205,7 +226,12 @@ pub fn validate_static_elf(data: &[u8]) -> io::Result<()> {
 }
 
 pub fn base_image(binary: Vec<u8>) -> io::Result<Image> {
-    validate_static_elf(&binary)?;
+    preset_image(binary, "rescue", &[])
+}
+
+pub fn preset_image(binary: Vec<u8>, preset: &str, commands: &[String]) -> io::Result<Image> {
+    let mut manifest = command_manifest(&binary)?;
+    manifest.commands = manifest.select(preset, commands)?;
     let mut image = Image::default();
     for path in [
         "bbin", "bin", "sbin", "etc/rbb", "dev", "proc", "sys", "run", "tmp", "root",
@@ -220,7 +246,14 @@ pub fn base_image(binary: Vec<u8>) -> io::Result<Image> {
         "etc/rbb/initramfs-release",
         Entry::file(b"rbb-initramfs v1\n".to_vec(), 0o644),
     )?;
-    for applet in rbb_cmds::APPLETS {
+    image.insert(
+        "etc/rbb/commands.json",
+        Entry::file(
+            serde_json::to_vec(&manifest).map_err(io::Error::other)?,
+            0o644,
+        ),
+    )?;
+    for applet in &manifest.commands {
         image.insert(&format!("bbin/{applet}"), Entry::link("rbb"))?;
         image.insert(
             &format!("bin/{applet}"),
@@ -241,6 +274,8 @@ pub fn base_image(binary: Vec<u8>) -> io::Result<Image> {
             mode: 0o020600,
             data: Vec::new(),
             device: (5, 1),
+            uid: 0,
+            gid: 0,
         },
     )?;
     image.insert(
@@ -249,6 +284,8 @@ pub fn base_image(binary: Vec<u8>) -> io::Result<Image> {
             mode: 0o020666,
             data: Vec::new(),
             device: (1, 3),
+            uid: 0,
+            gid: 0,
         },
     )?;
     Ok(image)

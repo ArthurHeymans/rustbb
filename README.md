@@ -8,7 +8,9 @@ The workspace also includes **rbb-init** (PID 1/service supervision), **rbb-cmds
 (a static multicall rescue userland), and **rbb-mkimage** (reproducible initramfs
 builder). [Disk-root handoff](docs/disk-boot.md), [local kexec](docs/kernel-boot.md)
 and [DHCP/HTTP(S)/TFTP netboot](docs/network-boot.md) are boot-tested on x86_64
-and arm64. See [building, services and tests](docs/initramfs.md) and the
+and arm64. [Image presets and base-CPIO merging](docs/image-builder.md) use target
+ELF command inventories without executing foreign binaries. See
+[building, services and tests](docs/initramfs.md) and the
 [approved roadmap / remaining work](docs/boot-roadmap.md).
 This is not a complete s6 clone or full u-root replacement.
 

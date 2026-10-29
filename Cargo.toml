@@ -8,6 +8,7 @@ members = [
     "rbb_boot",
     "rbb_cmds",
     "rbb_mkimage",
+    "rbb_manifest",
     "examples/simple_echo",
     "examples/simple_cat",
     "examples/head",

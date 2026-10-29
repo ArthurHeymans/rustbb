@@ -274,6 +274,12 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "a6ef517f0926dd24a1582492c791b6a4818a4d94e789a334894aa15b0d12f55c"
 
 [[package]]
+name = "cpio"
+version = "0.4.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "938e716cb1ade5d6c8f959c13a7248b889c07491fc7e41167c3afe20f8f0de1e"
+
+[[package]]
 name = "cpufeatures"
 version = "0.3.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1042,6 +1048,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "object"
+version = "0.40.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "dd229a0361b9d0d4396176e02d65897f487eebeab7caa6d443855ee152ca0b9c"
+dependencies = [
+ "memchr",
+]
+
+[[package]]
 name = "once_cell"
 version = "1.21.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1198,6 +1213,8 @@ dependencies = [
  "libc",
  "rbb-boot",
  "rbb-init",
+ "rbb-manifest",
+ "serde_json",
  "tempfile",
 ]
 
@@ -1213,15 +1230,25 @@ dependencies = [
 ]
 
 [[package]]
+name = "rbb-manifest"
+version = "0.1.0"
+dependencies = [
+ "serde",
+ "serde_json",
+]
+
+[[package]]
 name = "rbb-mkimage"
 version = "0.1.0"
 dependencies = [
  "clap",
+ "cpio",
  "ed25519-dalek",
  "flate2",
+ "object",
  "rbb-boot",
- "rbb-cmds",
  "rbb-init",
+ "rbb-manifest",
  "serde_json",
  "tempfile",
 ]

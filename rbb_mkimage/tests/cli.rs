@@ -1,16 +1,8 @@
 use std::fs;
 use std::process::Command;
 
-// Minimal structural ELF fixture for packager tests, not a runnable guest.
-fn elf() -> Vec<u8> {
-    let mut data = vec![0; 120];
-    data[..6].copy_from_slice(b"\x7fELF\x02\x01");
-    data[16] = 2;
-    data[32] = 64;
-    data[54] = 56;
-    data[56] = 1;
-    data
-}
+mod common;
+use common::elf;
 
 #[test]
 fn reproducible_cli_and_failed_build_preserves_output() {
