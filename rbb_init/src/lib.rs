@@ -90,6 +90,11 @@ pub fn boot_filesystems() -> io::Result<()> {
     Ok(())
 }
 
+enum Handoff {
+    Root(rbb_boot::root::PreparedRoot),
+    Kexec,
+}
+
 pub fn run(args: &[String]) -> io::Result<()> {
     let mut config_path = "/etc/rbb/init.toml".to_string();
     let mut standalone = false;
@@ -135,6 +140,19 @@ pub fn run(args: &[String]) -> io::Result<()> {
             ) {
                 rbb_boot::modules::load(module, "")?;
             }
+            if let Some(mut boot) = config.boot.clone() {
+                if let Some(source) = cmdline.get("rbb.boot.source") {
+                    boot.source = source.into();
+                }
+                if let Some(entry) = cmdline.get("rbb.boot.entry") {
+                    boot.entry = Some(entry.into());
+                }
+                if cmdline.contains("rbb.boot.menu") {
+                    boot.menu = true;
+                }
+                rbb_boot::loader::load(&boot)?;
+                return Ok(Some(Handoff::Kexec));
+            }
             if let Some(root) = rbb_boot::RootConfig::from_cmdline(&cmdline, config.root.clone())? {
                 if let Some(delay) = cmdline.get("rootdelay") {
                     let seconds: u64 = delay.parse().map_err(io::Error::other)?;
@@ -143,14 +161,16 @@ pub fn run(args: &[String]) -> io::Result<()> {
                     }
                     std::thread::sleep(std::time::Duration::from_secs(seconds));
                 }
-                return rbb_boot::root::PreparedRoot::prepare(&root).map(Some);
+                return rbb_boot::root::PreparedRoot::prepare(&root)
+                    .map(|root| Some(Handoff::Root(root)));
             }
             Ok(None)
         })();
         match boot {
             // After this point a mount-move failure is fatal, not recoverable
             // by starting services against a potentially half-switched root.
-            Ok(Some(root)) => return root.exec(),
+            Ok(Some(Handoff::Root(root))) => return root.exec(),
+            Ok(Some(Handoff::Kexec)) => return rbb_boot::loader::execute(),
             Ok(None) => {}
             Err(error) => {
                 eprintln!("rbb-init: boot preparation failed: {error}; entering configured rescue services");

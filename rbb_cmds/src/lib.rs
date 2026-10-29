@@ -1,3 +1,4 @@
+mod boot;
 mod shell;
 
 use std::ffi::CString;
@@ -10,7 +11,7 @@ use std::time::Duration;
 pub const APPLETS: &[&str] = &[
     "init", "ctl", "sh", "echo", "cat", "ls", "mkdir", "cp", "mv", "rm", "ln", "readlink", "chmod",
     "pwd", "sleep", "true", "false", "uname", "mount", "umount", "insmod", "dmesg", "ps", "free",
-    "kill", "poweroff", "reboot", "modprobe", "lsmod", "rmmod", "blkid",
+    "kill", "poweroff", "reboot", "modprobe", "lsmod", "rmmod", "blkid", "boot", "kexec",
 ];
 
 fn invalid(message: &str) -> io::Error {
@@ -72,6 +73,8 @@ pub fn entry(mut args: Vec<String>) -> i32 {
 
 pub fn run(name: &str, args: &[String]) -> io::Result<i32> {
     match name {
+        "boot" => boot::boot(args)?,
+        "kexec" => boot::kexec(args)?,
         "true" => {}
         "false" => return Ok(1),
         "sh" => return shell::run(args),

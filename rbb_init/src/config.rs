@@ -59,6 +59,7 @@ pub struct Config {
     pub services: Vec<Service>,
     /// Optional real disk root; kernel root= parameters can override this.
     pub root: Option<rbb_boot::RootConfig>,
+    pub boot: Option<rbb_boot::model::BootConfig>,
     #[serde(default)]
     pub modules: Vec<String>,
 }
@@ -90,8 +91,14 @@ impl Config {
                 "control socket must be an absolute path <= 100 bytes".into(),
             ));
         }
+        if self.root.is_some() && self.boot.is_some() {
+            return Err(invalid("root and boot are mutually exclusive".into()));
+        }
         if let Some(root) = &self.root {
             root.validate()?;
+        }
+        if let Some(boot) = &self.boot {
+            boot.validate()?;
         }
         if self
             .modules

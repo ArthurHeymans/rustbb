@@ -1,0 +1,24 @@
+Rust initramfs toolkit: third-party source availability
+=====================================================
+
+Our own source files are licensed MIT OR Apache-2.0. Dependencies retain their
+own licenses; linking does not relicense their source code.
+
+boot-loader-spec 0.1.5 — MPL-2.0
+Copyright 2022 Alberto Ruiz <aruiz@gnome.org>
+
+This image links the unmodified boot-loader-spec library. Its Source Code Form
+is subject to the terms of the Mozilla Public License, v. 2.0. Its corresponding
+source, including the copyright/license notices, is available at:
+https://crates.io/api/v1/crates/boot-loader-spec/0.1.5/download
+Upstream: https://gitlab.com/aruiz/rust-bls
+License text: https://www.mozilla.org/MPL/2.0/
+
+Any distributed modifications to MPL-covered files must also be made available
+under the MPL. Our adapters use the library API and do not copy its source files.
+Keep this notice and the corresponding source URL with distributed images.
+
+Other dependencies and exact versions are recorded in Cargo.lock. See each
+upstream crate's source distribution for its license and copyright notices.
+A complete distribution must retain applicable notices for all dependencies,
+not only the MPL library called out here.

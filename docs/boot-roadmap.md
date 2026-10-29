@@ -2,8 +2,9 @@
 
 **Status:** A–E approved, including the MPL-2.0 BLS parser. Implementation is
 incremental; optional extensions below remain separate. Rescue initramfs and
-[guarded disk-root handoff](disk-boot.md) are now tested on x86_64 and arm64.
-Local-kernel and network-kernel handoff are the next increments.
+[guarded disk-root handoff](disk-boot.md) and [local kernel boot](kernel-boot.md)
+are tested on x86_64 and arm64. Network boot and remaining builder/supervision
+features are the next increments.
 
 ## What was inspected
 

@@ -75,6 +75,13 @@ impl Drop for SocketGuard {
     }
 }
 
+#[derive(Clone, Copy)]
+enum Shutdown {
+    Poweroff,
+    Reboot,
+    Kexec,
+}
+
 struct State {
     pid: Option<i32>,
     desired: bool,
@@ -123,17 +130,17 @@ pub fn supervise(config: Config, reboot_host: bool) -> io::Result<()> {
             stopping: None,
         })
         .collect();
-    let mut shutdown: Option<(Instant, bool)> = None;
+    let mut shutdown: Option<(Instant, Shutdown)> = None;
     let mut killed = false;
     eprintln!("rbb-init: supervising {} services", states.len());
     loop {
         for signal in signals.drain() {
             match signal {
                 libc::SIGTERM | libc::SIGUSR1 => {
-                    shutdown.get_or_insert((Instant::now(), false));
+                    shutdown.get_or_insert((Instant::now(), Shutdown::Poweroff));
                 }
                 libc::SIGINT | libc::SIGUSR2 => {
-                    shutdown.get_or_insert((Instant::now(), true));
+                    shutdown.get_or_insert((Instant::now(), Shutdown::Reboot));
                 }
                 _ => {} // SIGCHLD is drained by waitpid; HUP deliberately does not reload.
             }
@@ -209,7 +216,11 @@ pub fn supervise(config: Config, reboot_host: bool) -> io::Result<()> {
                     })
                     .collect::<String>(),
                 ["poweroff"] | ["reboot"] => {
-                    shutdown.get_or_insert((Instant::now(), words[0] == "reboot"));
+                    shutdown.get_or_insert((Instant::now(), if words[0] == "reboot" { Shutdown::Reboot } else { Shutdown::Poweroff }));
+                    "ok\n".into()
+                }
+                ["kexec"] if reboot_host && rbb_boot::loader::kexec_loaded() => {
+                    shutdown.get_or_insert((Instant::now(), Shutdown::Kexec));
                     "ok\n".into()
                 }
                 [verb @ ("up" | "down" | "restart"), name] if shutdown.is_none() => {
@@ -235,13 +246,13 @@ pub fn supervise(config: Config, reboot_host: bool) -> io::Result<()> {
                         format!("error: unknown service {name}\n")
                     }
                 }
-                _ => "error: expected status | up/down/restart NAME | poweroff | reboot\n".into(),
+                _ => "error: expected status | up/down/restart NAME | poweroff | reboot | kexec (PID 1, loaded image)\n".into(),
             };
             if let Some(path) = peer.as_pathname() {
                 let _ = socket.send_to(response.as_bytes(), path);
             }
         }
-        if let Some((start, reboot)) = shutdown {
+        if let Some((start, action)) = shutdown {
             if states.iter().any(|s| s.desired) {
                 eprintln!("rbb-init: shutdown requested");
                 for &i in order.iter().rev() {
@@ -279,10 +290,10 @@ pub fn supervise(config: Config, reboot_host: bool) -> io::Result<()> {
                 if reboot_host {
                     unsafe {
                         libc::sync();
-                        libc::reboot(if reboot {
-                            libc::RB_AUTOBOOT
-                        } else {
-                            libc::RB_POWER_OFF
+                        libc::reboot(match action {
+                            Shutdown::Reboot => libc::RB_AUTOBOOT,
+                            Shutdown::Poweroff => libc::RB_POWER_OFF,
+                            Shutdown::Kexec => libc::LINUX_REBOOT_CMD_KEXEC,
                         });
                     }
                     return Err(io::Error::last_os_error());

@@ -229,6 +229,13 @@ pub fn base_image(binary: Vec<u8>) -> io::Result<Image> {
     }
     image.insert("init", Entry::link("bbin/init"))?;
     image.insert(
+        "etc/rbb/third-party-notices.txt",
+        Entry::file(
+            include_bytes!("../../docs/third-party-notices.txt").to_vec(),
+            0o644,
+        ),
+    )?;
+    image.insert(
         "dev/console",
         Entry {
             mode: 0o020600,
