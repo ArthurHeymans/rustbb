@@ -13,6 +13,9 @@ pub fn boot(args: &[String]) -> io::Result<()> {
         require_hashes: false,
         menu: false,
         timeout_ms: 5000,
+        tls_ca: None,
+        manifest_key: None,
+        signature: None,
     };
     let (mut list, mut load_only) = (false, false);
     let mut args = args.iter();
@@ -22,6 +25,9 @@ pub fn boot(args: &[String]) -> io::Result<()> {
             "--entry" => config.entry = Some(args.next().ok_or_else(|| invalid("--entry needs an id"))?.clone()),
             "--append" => config.append = args.next().ok_or_else(|| invalid("--append needs a command line"))?.clone(),
             "--timeout-ms" => config.timeout_ms = args.next().ok_or_else(|| invalid("--timeout-ms needs a number"))?.parse().map_err(io::Error::other)?,
+            "--tls-ca" => config.tls_ca = Some(args.next().ok_or_else(|| invalid("--tls-ca needs a file"))?.clone()),
+            "--manifest-key" => config.manifest_key = Some(args.next().ok_or_else(|| invalid("--manifest-key needs a file"))?.clone()),
+            "--signature" => config.signature = Some(args.next().ok_or_else(|| invalid("--signature needs a source"))?.clone()),
             "--require-hashes" => config.require_hashes = true,
             "--menu" => config.menu = true,
             "--no-load" | "--list" => list = true,
@@ -31,7 +37,11 @@ pub fn boot(args: &[String]) -> io::Result<()> {
     }
     config.validate()?;
     if list {
-        let catalog = loader::catalog(&config.source, config.require_hashes)?;
+        let policy = rbb_boot::fetch::Policy {
+            tls_ca: config.tls_ca.as_ref().map(std::path::PathBuf::from),
+            ..rbb_boot::fetch::Policy::default()
+        };
+        let catalog = loader::catalog_config(&config, &policy)?;
         for entry in &catalog.entries {
             println!(
                 "{}\t{}\t{}\t{}",

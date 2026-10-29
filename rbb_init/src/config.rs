@@ -60,6 +60,7 @@ pub struct Config {
     /// Optional real disk root; kernel root= parameters can override this.
     pub root: Option<rbb_boot::RootConfig>,
     pub boot: Option<rbb_boot::model::BootConfig>,
+    pub network: Option<rbb_boot::network::NetConfig>,
     #[serde(default)]
     pub modules: Vec<String>,
 }
@@ -99,6 +100,9 @@ impl Config {
         }
         if let Some(boot) = &self.boot {
             boot.validate()?;
+        }
+        if let Some(network) = &self.network {
+            network.validate()?;
         }
         if self
             .modules

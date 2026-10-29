@@ -72,14 +72,9 @@ fn stage_artifact(
     artifact: &Artifact,
     directory: &Path,
     max: u64,
+    policy: &crate::fetch::Policy,
 ) -> io::Result<tempfile::NamedTempFile> {
-    if artifact.source.contains("://") {
-        return Err(invalid("network artifact sources are not enabled yet"));
-    }
-    let input = File::open(&artifact.source)?;
-    if !input.metadata()?.is_file() {
-        return Err(invalid("boot artifact must be a regular file"));
-    }
+    let input = crate::fetch::artifact(&artifact.source, policy)?;
     let mut output = tempfile::NamedTempFile::new_in(directory)?;
     copy_verified(input, &mut output, max, artifact.sha256.as_deref())?;
     output.as_file_mut().seek(SeekFrom::Start(0))?;
@@ -93,10 +88,23 @@ pub struct Staged {
 }
 impl Staged {
     pub fn prepare(entry: &BootEntry, directory: &Path, require_hashes: bool) -> io::Result<Self> {
+        Self::prepare_with_policy(
+            entry,
+            directory,
+            require_hashes,
+            &crate::fetch::Policy::default(),
+        )
+    }
+    pub fn prepare_with_policy(
+        entry: &BootEntry,
+        directory: &Path,
+        require_hashes: bool,
+        policy: &crate::fetch::Policy,
+    ) -> io::Result<Self> {
         entry.validate(require_hashes)?;
         fs::create_dir_all(directory)?;
         fs::set_permissions(directory, fs::Permissions::from_mode(0o700))?;
-        let kernel = stage_artifact(&entry.kernel, directory, MAX_KERNEL)?;
+        let kernel = stage_artifact(&entry.kernel, directory, MAX_KERNEL, policy)?;
         validate_kernel(kernel.as_file(), &entry.architecture)?;
         let mut combined = if entry.initrd.is_empty() {
             None
@@ -106,9 +114,13 @@ impl Staged {
         let mut size = 0;
         if let Some(output) = &mut combined {
             for artifact in &entry.initrd {
-                let input = stage_artifact(artifact, directory, MAX_INITRD)?;
-                let mut file = File::open(input.path())?;
-                size += io::copy(&mut file, output)?;
+                let input = crate::fetch::artifact(&artifact.source, policy)?;
+                size += copy_verified(
+                    input,
+                    &mut *output,
+                    MAX_INITRD - size,
+                    artifact.sha256.as_deref(),
+                )?;
                 let padding = (4 - size % 4) % 4;
                 output.write_all(&[0; 3][..padding as usize])?;
                 size += padding;
@@ -193,14 +205,61 @@ pub fn execute() -> io::Result<()> {
 }
 
 pub fn catalog(source: &str, require_hashes: bool) -> io::Result<Catalog> {
+    let config = BootConfig {
+        source: source.into(),
+        entry: None,
+        append: String::new(),
+        require_hashes,
+        menu: false,
+        timeout_ms: 5000,
+        tls_ca: None,
+        manifest_key: None,
+        signature: None,
+    };
+    catalog_config(&config, &crate::fetch::Policy::default())
+}
+
+pub fn catalog_config(config: &BootConfig, policy: &crate::fetch::Policy) -> io::Result<Catalog> {
+    let source = if config.source == "dhcp" {
+        crate::network::saved_boot_url()?
+    } else {
+        config.source.clone()
+    };
+    let require_hashes = config.require_hashes || config.manifest_key.is_some();
+    if source.contains("://") {
+        let url = url::Url::parse(&source).map_err(io::Error::other)?;
+        return crate::netboot::catalog(&url, config, policy).map(Catalog::entries);
+    }
     if source == "disk" {
+        if config.manifest_key.is_some() {
+            return Err(invalid(
+                "manifest signatures require a native manifest, not raw disk config scanning",
+            ));
+        }
         return Catalog::disks();
     }
-    let path = Path::new(source);
+    let path = Path::new(&source);
     if path.is_dir() {
+        if config.manifest_key.is_some() {
+            return Err(invalid(
+                "manifest signatures require a native manifest file",
+            ));
+        }
         return Catalog::directory(path);
     }
-    let mut manifest = Manifest::parse(&local::read_config(path)?, require_hashes)?;
+    let text = local::read_config(path)?;
+    if let Some(key) = &config.manifest_key {
+        let signature = config
+            .signature
+            .clone()
+            .unwrap_or_else(|| format!("{source}.sig"));
+        let mut bytes = Vec::new();
+        crate::fetch::artifact(&signature, policy)?
+            .take(1025)
+            .read_to_end(&mut bytes)?;
+        crate::verification::verify(text.as_bytes(), Path::new(key), &bytes)?;
+    }
+    let mut manifest = Manifest::parse(&text, require_hashes)?;
     let parent = fs::canonicalize(path)?
         .parent()
         .ok_or_else(|| invalid("manifest has no directory"))?
@@ -302,16 +361,21 @@ pub fn choose<'a>(entries: &'a [BootEntry], config: &BootConfig) -> io::Result<&
 
 pub fn load(config: &BootConfig) -> io::Result<()> {
     config.validate()?;
-    let catalog = catalog(&config.source, config.require_hashes)?;
+    let policy = crate::fetch::Policy {
+        tls_ca: config.tls_ca.as_ref().map(PathBuf::from),
+        ..crate::fetch::Policy::default()
+    };
+    let catalog = catalog_config(config, &policy)?;
     let mut entry = choose(&catalog.entries, config)?.clone();
     if !config.append.is_empty() {
         entry.cmdline.push(' ');
         entry.cmdline.push_str(&config.append);
     }
-    let staged = Staged::prepare(
+    let staged = Staged::prepare_with_policy(
         &entry,
         &PathBuf::from("/run/rbb/boot/stage"),
-        config.require_hashes,
+        config.require_hashes || config.manifest_key.is_some(),
+        &policy,
     )?;
     staged.load()?;
     // Both source mounts and staging files can now be released; the kernel has

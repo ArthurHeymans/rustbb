@@ -100,7 +100,11 @@ impl Manifest {
         if text.len() > 1024 * 1024 {
             return Err(invalid("boot manifest exceeds 1MiB"));
         }
-        let manifest: Self = toml::from_str(text).map_err(io::Error::other)?;
+        let manifest: Self = if text.trim_start().starts_with('{') {
+            serde_json::from_str(text).map_err(io::Error::other)?
+        } else {
+            toml::from_str(text).map_err(io::Error::other)?
+        };
         if manifest.version != 1 || manifest.entries.is_empty() || manifest.entries.len() > 256 {
             return Err(invalid(
                 "unsupported/empty boot manifest or too many entries",
@@ -131,11 +135,24 @@ pub struct BootConfig {
     pub menu: bool,
     #[serde(default = "timeout")]
     pub timeout_ms: u64,
+    pub tls_ca: Option<String>,
+    pub manifest_key: Option<String>,
+    pub signature: Option<String>,
 }
 impl BootConfig {
     pub fn validate(&self) -> io::Result<()> {
         if self.source.is_empty()
+            || self.source.len() > 4096
             || self.source.contains('\0')
+            || [
+                self.tls_ca.as_ref(),
+                self.manifest_key.as_ref(),
+                self.signature.as_ref(),
+            ]
+            .into_iter()
+            .flatten()
+            .any(|s| s.is_empty() || s.len() > 4096 || s.contains('\0'))
+            || (self.signature.is_some() && self.manifest_key.is_none())
             || self.append.contains(['\0', '\n', '\r'])
             || self.append.len() > 2048
             || self.timeout_ms > 300_000

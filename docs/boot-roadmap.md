@@ -3,8 +3,25 @@
 **Status:** A–E approved, including the MPL-2.0 BLS parser. Implementation is
 incremental; optional extensions below remain separate. Rescue initramfs and
 [guarded disk-root handoff](disk-boot.md) and [local kernel boot](kernel-boot.md)
-are tested on x86_64 and arm64. Network boot and remaining builder/supervision
-features are the next increments.
+and [DHCPv4 network boot](network-boot.md) are tested on x86_64 and arm64.
+
+Implemented milestones:
+- Guarded disk-root exec as PID 1; UUID/LABEL/PARTUUID discovery; explicit modules
+  and dependency/alias resolution (7 disk handoff/rescue cases per architecture).
+- BLS plus bounded GRUB/extlinux subsets, verified kernel/initrd staging and real
+  kexec, including live-service shutdown (6 cases per architecture).
+- DHCPv4/static IPv4, BOOTP/PXE metadata, HTTP(S)/TFTP, PXELINUX and a documented
+  iPXE subset, native manifests, Ed25519 and validated TLS, including redirects and blocked
+  HTTPS downgrade (13 cases per architecture).
+- Repeated deterministic image builds, pinned-source test kernels with fixed build
+  identity/time, and bad-hash/signature/TLS/download/DHCP-timeout rescue tests.
+
+**Not yet implemented:** D's presets/command manifest, base CPIO merging, richer
+uutils/brush userland and readiness/hooks/log routing/privilege dropping; C's
+DHCPv6/SLAAC integration, IPv6 E2E tests and ordered multi-source boot policy;
+A's automatic uevent/module handling, softdeps and zstd modules. Classic kexec,
+custom DTB replacement and the optional extensions remain outside this increment.
+The existing shell is still the explicitly minimal interpreter, not POSIX/Bash.
 
 ## What was inspected
 
@@ -127,10 +144,12 @@ NFS/iSCSI root is not implied by downloading a kernel/initrd over the network.
 ## Existing Rust crates to reuse
 
 The following versions/licenses were checked against crates.io metadata and,
-where noted, upstream API docs. **Candidates are researched, not integration-
-tested or final dependency selections.** No new boot dependencies are added by
-this proposal. Pin accepted versions in Cargo.lock, audit transitive licenses,
-and run static musl + QEMU checks on both architectures before adoption.
+where noted, upstream API docs. This table records the initial candidate research,
+not a claim that every candidate was adopted. Actual choices are in Cargo.lock
+and the implementation guides above. Adopted dependencies were checked with
+static musl builds and QEMU on both architectures; generated notices/source
+pointers are embedded in images from `docs/third-party-notices.txt`. Regenerate
+with `python3 scripts/generate-notices.py` after dependency changes.
 
 | Area | Candidate | Decision / remaining work |
 |---|---|---|
@@ -138,14 +157,14 @@ and run static musl + QEMU checks on both architectures before adoption.
 | Real shell | [`brush-core` 0.5.0 / `brush-shell` 0.4.0](https://github.com/reubeno/brush), MIT | Stronger choice than writing another shell; evaluate API integration, serial terminal behavior, dependencies and size. |
 | Linux syscall wrappers | [`nix` 0.31.3](https://docs.rs/nix/0.31.3/nix/), MIT | Reuse mount, exec, signals and process primitives where practical; keep narrow audited unsafe wrappers only for gaps. |
 | Link/address/route configuration | [`rtnetlink` 0.23.0](https://docs.rs/rtnetlink/0.23.0/rtnetlink/), MIT | Reuse packet/transport machinery, with a per-command runtime if needed; don't implement netlink framing ourselves. |
-| DHCP client | [`mozim` 0.3.3](https://docs.rs/mozim/0.3.3/mozim/), Apache-2.0 | Existing v4/v6 client state machines. Its lease API includes raw-option access, but bootfile/BOOTP exposure and architecture options need a spike. |
+| DHCP client | [`mozim` 0.3.3](https://docs.rs/mozim/0.3.3/mozim/), Apache-2.0 | Adopted for v4 with a small Apache-2.0 vendor patch exposing BOOTP fields, option overload and client boot options; wire tests and dual-architecture guest boots pass. See vendor/mozim/RBB_PATCHES.md. V6 integration remains pending. |
 | DHCP protocol fallback | [`dhcproto` 0.15.0](https://docs.rs/dhcproto/0.15.0/dhcproto/), MIT | Use if mozim cannot expose required PXE fields/options; codec only, **not** a replacement client state machine. |
-| HTTP/TLS | [`ureq` 3.5.0](https://docs.rs/ureq/3.5.0/ureq/) + [`rustls` 0.23.46](https://docs.rs/rustls/0.23.46/rustls/), permissive | Prefer reusable streaming/timeouts/TLS, select crypto backend deliberately, and test static/cross build requirements. |
-| TFTP | [`tftp-client` 0.3.0](https://docs.rs/tftp-client/0.3.0/tftp_client/), Apache-2.0 OR MIT | Has retries/backoff and RFC1350 transfers. Audit server transfer-ID checks, large-file block wrap, options and cancellation before using it for kernels. |
+| HTTP/TLS | [`ureq` 3.5.0](https://docs.rs/ureq/3.5.0/ureq/) + [`rustls` 0.23.46](https://docs.rs/rustls/0.23.46/rustls/), permissive | Adopted with rustls/ring, bounded streaming and timeouts; custom CA and strict certificate verification tested on both targets. Ring needs a target C/assembly compiler. |
+| TFTP | [`tftp-client` 0.3.0](https://docs.rs/tftp-client/0.3.0/tftp_client/), Apache-2.0 OR MIT | Codec adopted, downloader deliberately not used: unbounded buffering and missing TID/duplicate checks. Our bounded streaming adapter supplies these checks, retries/deadlines and block wrap. TFTP guest kexec passes on both targets. |
 | GPT/MBR | [`gptman` 3.1.1](https://docs.rs/gptman/3.1.1/gptman/) + [`mbrman` 0.6.1](https://docs.rs/mbrman/0.6.1/mbrman/), MIT OR Apache-2.0 | Reuse read-only parsing and CRC validation; [`gpt` 4.1.0](https://docs.rs/gpt/4.1.0/gpt/) (MIT) is another candidate. Kernel mounts still handle filesystem I/O. |
 | Filesystem identification | [`ext4-view` 1.0.0](https://docs.rs/ext4-view/1.0.0/ext4_view/), MIT OR Apache-2.0; [`fatfs` 0.3.6](https://docs.rs/fatfs/0.3.6/fatfs/), MIT | Evaluate for label/UUID discovery and image fixtures, not a rewrite of the kernel filesystem drivers. libblkid wrappers bring a native C dependency. |
-| BLS parsing | [`boot-loader-spec` 0.1.5](https://docs.rs/boot-loader-spec/0.1.5/boot_loader_spec/), **MPL-2.0** | Existing Type #1 parser; excludes some UKI-related keys. Needs explicit license acceptance, or use a permissive alternative / small spec parser. Not a GRUB parser. |
-| Kernel handoff | [`kexec-loader` 0.17.0](https://docs.rs/kexec-loader/0.17.0/kexec_loader/), MIT OR Apache-2.0 | Small, young crate; inspect `load_dry` and error handling. **File syscall only**, no classic segment/DTB loader. Do not couple download to immediate execution. |
+| BLS parsing | [`boot-loader-spec` 0.1.5](https://docs.rs/boot-loader-spec/0.1.5/boot_loader_spec/), **MPL-2.0** | Adopted after explicit MPL-2.0 approval; corresponding source URL and notices are embedded. Existing Type #1 parser, not a GRUB/UKI loader. |
+| Kernel handoff | [`kexec-loader` 0.17.0](https://docs.rs/kexec-loader/0.17.0/kexec_loader/), MIT OR Apache-2.0 | Adopted on x86_64. Its missing aarch64-musl libc syscall constant required a narrow arm64 syscall adapter. **File syscall only**, no classic segment/DTB loader. Loading remains separate from execution; both targets reach second kernels. |
 | Image/ELF parsing | [`object` 0.40.0](https://docs.rs/object/0.40.0/object/), MIT OR Apache-2.0 | Reuse for ELF/PE structural checks where needed; not itself a Linux boot protocol or firmware loader. |
 | CPIO/compression | [`cpio` 0.4.1](https://docs.rs/cpio/0.4.1/cpio/), MIT; existing `flate2`; [`lzma-rust2` 0.24.0](https://docs.rs/lzma-rust2/0.24.0/lzma_rust2/), Apache-2.0 | Reuse archive reading and compression for merging/modules; keep or replace the current tested deterministic writer only with equivalent behavior/tests. |
 | Digests/signatures | [`sha2` 0.11.1](https://docs.rs/sha2/0.11.1/sha2/), MIT OR Apache-2.0; [`ed25519-dalek` 3.0.0](https://docs.rs/ed25519-dalek/3.0.0/ed25519_dalek/), BSD-3-Clause | Reuse vetted crypto; implement trust policy/manifest binding, not cryptographic primitives. |

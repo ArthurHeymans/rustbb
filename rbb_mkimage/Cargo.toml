@@ -1,5 +1,6 @@
 [package]
 name = "rbb-mkimage"
+default-run = "rbb-mkimage"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
@@ -12,3 +13,5 @@ rbb-cmds = { path = "../rbb_cmds" }
 rbb-init = { path = "../rbb_init" }
 serde_json = "1"
 tempfile = "3"
+rbb-boot = { path = "../rbb_boot" }
+ed25519-dalek = "3"

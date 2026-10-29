@@ -102,6 +102,12 @@ struct Draft {
 }
 impl Draft {
     fn finish(self, root: &Path) -> io::Result<Option<BootEntry>> {
+        self.finish_with(&|path| rooted(root, path))
+    }
+    fn finish_with(
+        self,
+        resolve: &impl Fn(&str) -> io::Result<Artifact>,
+    ) -> io::Result<Option<BootEntry>> {
         if self.unsupported {
             return Err(invalid(format!(
                 "{}: unsupported procedural config, variable or custom device tree",
@@ -118,11 +124,11 @@ impl Draft {
             id: self.id,
             title: self.title,
             architecture: std::env::consts::ARCH.into(),
-            kernel: rooted(root, &kernel)?,
+            kernel: resolve(&kernel)?,
             initrd: self
                 .initrd
                 .iter()
-                .map(|p| rooted(root, p))
+                .map(|p| resolve(p))
                 .collect::<io::Result<_>>()?,
             cmdline: self.cmdline,
         };
@@ -132,6 +138,13 @@ impl Draft {
 }
 
 pub fn parse_extlinux(text: &str, root: &Path) -> io::Result<Vec<BootEntry>> {
+    parse_pxe(text, &|path| rooted(root, path))
+}
+
+pub fn parse_pxe(
+    text: &str,
+    resolve: &impl Fn(&str) -> io::Result<Artifact>,
+) -> io::Result<Vec<BootEntry>> {
     let mut entries = Vec::new();
     let mut current = None::<Draft>;
     for line in text
@@ -143,7 +156,7 @@ pub fn parse_extlinux(text: &str, root: &Path) -> io::Result<Vec<BootEntry>> {
         let rest = rest.trim();
         if word.eq_ignore_ascii_case("label") {
             if let Some(draft) = current.take() {
-                if let Some(entry) = draft.finish(root)? {
+                if let Some(entry) = draft.finish_with(resolve)? {
                     entries.push(entry);
                 }
             }
@@ -173,7 +186,7 @@ pub fn parse_extlinux(text: &str, root: &Path) -> io::Result<Vec<BootEntry>> {
         }
     }
     if let Some(draft) = current {
-        if let Some(entry) = draft.finish(root)? {
+        if let Some(entry) = draft.finish_with(resolve)? {
             entries.push(entry);
         }
     }

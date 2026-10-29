@@ -6,8 +6,11 @@
 
 The workspace also includes **rbb-init** (PID 1/service supervision), **rbb-cmds**
 (a static multicall rescue userland), and **rbb-mkimage** (reproducible initramfs
-builder). See [build, boot, services and QEMU tests](docs/initramfs.md).
-This is an MVP, not a complete s6 clone or full u-root replacement.
+builder). [Disk-root handoff](docs/disk-boot.md), [local kexec](docs/kernel-boot.md)
+and [DHCP/HTTP(S)/TFTP netboot](docs/network-boot.md) are boot-tested on x86_64
+and arm64. See [building, services and tests](docs/initramfs.md) and the
+[approved roadmap / remaining work](docs/boot-roadmap.md).
+This is not a complete s6 clone or full u-root replacement.
 
 ```sh
 rustup target add x86_64-unknown-linux-musl

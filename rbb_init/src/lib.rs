@@ -140,6 +140,11 @@ pub fn run(args: &[String]) -> io::Result<()> {
             ) {
                 rbb_boot::modules::load(module, "")?;
             }
+            if let Some(network) = &config.network {
+                rbb_boot::network::configure(network)?;
+            } else if config.boot.as_ref().is_some_and(|b| b.source == "dhcp") {
+                rbb_boot::network::configure(&rbb_boot::network::NetConfig::default())?;
+            }
             if let Some(mut boot) = config.boot.clone() {
                 if let Some(source) = cmdline.get("rbb.boot.source") {
                     boot.source = source.into();

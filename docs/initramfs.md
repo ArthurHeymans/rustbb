@@ -7,7 +7,7 @@ This workspace has four companion crates for `rustbb`:
 - **rbb-cmds**: a statically linkable multicall rescue userland, binary `rbb`.
 - **rbb-mkimage**: deterministic `newc` CPIO image builder, optionally gzip-compressed.
 - **rbb-boot**: device/module discovery, [disk-root handoff](disk-boot.md), and
-  [local Linux kernel boot](kernel-boot.md).
+  [local Linux kernel boot](kernel-boot.md), and [network boot](network-boot.md).
 
 This is a working **MVP**, not s6 compatibility or full u-root parity. The generic
 `rustbb` AST-based multicall builder remains independent; these boot-critical
@@ -17,8 +17,8 @@ needed to build an image. A Linux kernel is supplied separately.
 
 ## Build and boot
 
-Requirements: stable Rust, an installed musl target, and a matching Linux kernel
-and QEMU system emulator. x86_64 and arm64 are tested with TCG (no KVM/root
+Requirements: stable Rust, an installed musl target, a target C/assembly compiler
+for ring's TLS backend, and a matching Linux kernel and QEMU system emulator. x86_64 and arm64 are tested with TCG (no KVM/root
 needed). Python 3 is needed for the tests.
 
 From the workspace root:
@@ -42,8 +42,10 @@ On NixOS, if the host C linker injects its own loader, use Rust's bundled linker
 export CARGO_TARGET_X86_64_UNKNOWN_LINUX_MUSL_LINKER="$(rustc --print sysroot)/lib/rustlib/x86_64-unknown-linux-gnu/bin/rust-lld"
 ```
 
-The QEMU test harness selects this automatically. Only pure Rust plus `libc` is
-required by the guest. `rbb-mkimage --build --workspace PATH` builds a source
+The QEMU test harness selects this automatically. Guest binaries are static musl;
+there are no shared guest libraries, but the network-enabled build includes
+ring's compiled C/assembly crypto. The harness finds a native compiler or respects
+`CC_TARGET` / `AR_TARGET` variables (target triples use underscores). `rbb-mkimage --build --workspace PATH` builds a source
 workspace explicitly; packaging prebuilt binaries does not require sources:
 
 ```sh
@@ -64,7 +66,9 @@ static-checked; include their interpreters/libraries yourself if they need any.
 Kernel requirements include built-in initramfs support, ELF binaries, procfs,
 sysfs, devtmpfs, tmpfs, devpts, Unix datagram sockets, signalfd, serial console,
 and gzip decompression for compressed images. Device drivers needed at boot must
-be built in or supplied as modules. The tests use no disks or networking.
+be built in or supplied as modules. The baseline rescue tests use no disks or
+networking; separate disk-root, local-kexec and network suites use disposable
+images and isolated QEMU networking.
 
 ### arm64
 
@@ -75,8 +79,12 @@ python3 scripts/test-qemu.py --arch arm64 --kernel /path/to/arm64/Image
 
 The harness cross-links using Rust's bundled `rust-lld`, boots QEMU's `virt`
 machine with Cortex-A72 CPUs, uses the PL011 console (`ttyAMA0`), and checks ELF
-machine type and guest `uname`. No aarch64 host userspace or cross C compiler is
-required. Raw Linux Images and EFI gzip-zboot kernels are accepted; the harness
+machine type and guest `uname`. No aarch64 host userspace is required, but the TLS
+backend needs a target C/assembly compiler. The harness discovers conventional
+cross-compiler names or accepts `CC_aarch64_unknown_linux_musl` and optional
+`AR_aarch64_unknown_linux_musl`. A Linux GNU cross compiler also worked for ring's
+fixed-ABI objects in our tests; the guest libc still comes from Rust's musl target.
+Raw Linux Images and EFI gzip-zboot kernels are accepted; the harness
 extracts zboot's Linux Image for QEMU direct boot. It does not test UEFI boot.
 
 For a standalone image, use `rbb-mkimage --build --target
