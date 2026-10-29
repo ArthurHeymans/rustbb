@@ -285,6 +285,75 @@ fn run(role: &str) -> io::Result<i32> {
         "should-not-run" => {
             fs::write("/run/should-not-run", "bad")?;
         }
+        "disk-init" => {
+            check(
+                unsafe { libc::getpid() } == 1,
+                "real disk init is not PID 1",
+            )?;
+            check(
+                fs::read_to_string("/etc/disk-root-proof")? == "rbb-disk-root",
+                "not running from test disk",
+            )?;
+            check(
+                !Path::new("/bbin/rbb").exists()
+                    && !Path::new("/etc/rbb/initramfs-release").exists(),
+                "old initramfs is still visible",
+            )?;
+            let mounts = fs::read_to_string("/proc/mounts")?;
+            check(
+                mounts.lines().any(|l| l.contains(" / ext4 ")),
+                "real root is not ext4",
+            )?;
+            for (path, kind) in [
+                ("/proc", "proc"),
+                ("/sys", "sysfs"),
+                ("/dev", "devtmpfs"),
+                ("/run", "tmpfs"),
+            ] {
+                check(
+                    mounts
+                        .lines()
+                        .any(|l| l.contains(&format!(" {path} {kind} "))),
+                    "special mount was not moved",
+                )?;
+            }
+            let writable = fs::read_to_string("/proc/cmdline")?
+                .split_whitespace()
+                .any(|a| a == "rw");
+            let write = fs::write("/write-probe", "test");
+            check(
+                if writable {
+                    write.is_ok()
+                } else {
+                    write.is_err_and(|e| e.raw_os_error() == Some(libc::EROFS))
+                },
+                "root read-only/read-write policy",
+            )?;
+            println!("RBB_DISK_ROOT_PASS arch={}", std::env::consts::ARCH);
+            io::stdout().flush()?;
+            unsafe {
+                libc::sync();
+                libc::reboot(libc::RB_POWER_OFF);
+            }
+            return Err(io::Error::last_os_error());
+        }
+        "boot-fallback" => {
+            check(
+                unsafe { libc::getppid() } == 1,
+                "fallback not supervised by PID 1",
+            )?;
+            check(
+                Path::new("/bbin/rbb").exists(),
+                "fallback lost original root",
+            )?;
+            check(
+                !fs::read_to_string("/run/rbb/boot-error")?.is_empty(),
+                "boot failure was not recorded",
+            )?;
+            println!("RBB_BOOT_FALLBACK_PASS arch={}", std::env::consts::ARCH);
+            io::stdout().flush()?;
+            applet("ctl", &["poweroff"])?;
+        }
         "verify" => verify()?,
         _ => return Err(io::Error::other("unknown guest test role")),
     }
