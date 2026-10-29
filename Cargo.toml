@@ -3,6 +3,9 @@ resolver = "2"
 members = [
     "rustbb",
     "rustbb_runtime",
+    "rbb_init",
+    "rbb_cmds",
+    "rbb_mkimage",
     "examples/simple_echo",
     "examples/simple_cat",
     "examples/head",
@@ -14,3 +17,8 @@ members = [
 version = "0.1.0"
 edition = "2021"
 license = "MIT OR Apache-2.0"
+
+[profile.release]
+lto = true
+codegen-units = 1
+strip = true

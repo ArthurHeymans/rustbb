@@ -1,0 +1,15 @@
+# Services run in the foreground. `after` waits for successful oneshots or a
+# started longrun, not application readiness. Console shell is intentionally
+# unauthenticated: this is a rescue image, not a multi-user distribution.
+shutdown_timeout_ms = 3000
+
+[[services]]
+name = "hello"
+kind = "oneshot"
+command = ["/bin/echo", "Rust initramfs ready. Use ctl status, poweroff, or reboot."]
+
+[[services]]
+name = "console"
+command = ["/bin/sh"]
+after = ["hello"]
+restart_delay_ms = 1000

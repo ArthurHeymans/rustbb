@@ -1,0 +1,17 @@
+[package]
+name = "rbb-cmds"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "Multicall rescue userland for Rust initramfs images"
+
+[[bin]]
+name = "rbb"
+path = "src/main.rs"
+
+[dependencies]
+libc = "0.2"
+rbb-init = { path = "../rbb_init" }
+
+[dev-dependencies]
+tempfile = "3"

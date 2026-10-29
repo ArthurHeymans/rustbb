@@ -1,0 +1,14 @@
+[package]
+name = "rbb-mkimage"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "Reproducible newc initramfs builder for the Rust rescue userland"
+
+[dependencies]
+clap = { version = "4", features = ["derive"] }
+flate2 = "1"
+rbb-cmds = { path = "../rbb_cmds" }
+rbb-init = { path = "../rbb_init" }
+serde_json = "1"
+tempfile = "3"
