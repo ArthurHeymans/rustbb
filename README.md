@@ -2,6 +2,19 @@
 
 **rustbb** is a tool that combines multiple Rust CLI crates into a single multi-call binary, similar to [gobusybox](https://github.com/u-root/gobusybox) for Go. This is useful for embedded systems, containers, and other environments where minimizing binary count and size is important.
 
+## Initramfs toolkit
+
+The workspace also includes **rbb-init** (PID 1/service supervision), **rbb-cmds**
+(a static multicall rescue userland), and **rbb-mkimage** (reproducible initramfs
+builder). See [build, boot, services and QEMU tests](docs/initramfs.md).
+This is an MVP, not a complete s6 clone or full u-root replacement.
+
+```sh
+rustup target add x86_64-unknown-linux-musl
+cargo run -p rbb-mkimage -- --build -o target/rescue.cpio.gz
+python3 scripts/test-qemu.py --kernel /path/to/bzImage
+```
+
 ## Features
 
 - **Fetch from anywhere** - Combine crates from local paths, crates.io, or git repositories
