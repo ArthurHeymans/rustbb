@@ -231,8 +231,78 @@ fn verify() -> io::Result<()> {
     Ok(())
 }
 
+fn image_stage(role: &str) -> io::Result<()> {
+    use std::os::unix::fs::MetadataExt;
+    let command = rbb_boot::cmdline::Cmdline::parse(&fs::read_to_string("/proc/cmdline")?)?;
+    check(
+        command.get("rbb.image_proof") == Some(fs::read_to_string("/base-marker")?.as_str()),
+        "base marker is stale/missing",
+    )?;
+    check(
+        fs::metadata("/base-owned")?.uid() == 123 && fs::metadata("/base-owned")?.gid() == 456,
+        "base ownership not retained",
+    )?;
+    check(
+        fs::metadata("/base-fifo")?.mode() & 0o170000 == 0o010000,
+        "base FIFO not unpacked",
+    )?;
+    check(
+        fs::metadata("/base-device")?.rdev() == libc::makedev(1, 3),
+        "base device numbers changed",
+    )?;
+    check(
+        fs::read("/base-hard-one")? == b"shared" && fs::read("/base-link")? == b"shared",
+        "hardlink/symlink content lost",
+    )?;
+    check(
+        fs::metadata("/base-hard-one")?.nlink() == 1,
+        "hardlinks were not safely materialized",
+    )?;
+    if role == "image-uinit" {
+        fs::write("/run/image-uinit-done", "ok")?;
+        println!("RBB_IMAGE_UINIT_PASS");
+    } else {
+        check(
+            fs::read_to_string("/run/image-uinit-done")? == "ok",
+            "console started before uinit",
+        )?;
+        check(
+            fs::read_to_string("/inito")?.contains("image-uinit"),
+            "original init not preserved",
+        )?;
+        let manifest = rbb_manifest::Manifest::parse(&fs::read("/etc/rbb/commands.json")?)?;
+        check(
+            manifest.target.starts_with(std::env::consts::ARCH),
+            "foreign target inventory",
+        )?;
+        let preset = fs::read_to_string("/expected-preset")?;
+        check(
+            Path::new("/bin/wget").exists() == ["rescue", "netboot"].contains(&preset.as_str()),
+            "network alias preset selection",
+        )?;
+        check(
+            Path::new("/bin/blkid").exists() == ["rescue", "diskboot"].contains(&preset.as_str()),
+            "disk alias preset selection",
+        )?;
+        if preset == "netboot" {
+            check(
+                fs::read_to_string("/extra-marker")? == "second base",
+                "second archive not merged",
+            )?;
+        }
+        println!(
+            "RBB_IMAGE_PASS arch={} preset={preset}",
+            std::env::consts::ARCH
+        );
+        io::stdout().flush()?;
+        applet("ctl", &["poweroff"])?;
+    }
+    Ok(())
+}
+
 fn run(role: &str) -> io::Result<i32> {
     match role {
+        "image-uinit" | "image-check" => image_stage(role)?,
         "setup" => {
             check(
                 std::env::var("RBB_TEST").as_deref() == Ok("works"),
