@@ -21,13 +21,8 @@ def run(command, **kwargs):
 
 
 def build(arch):
-    env = os.environ.copy()
+    env = QEMU.build_environment(arch)
     target = QEMU.ARCHITECTURES[arch]["target"]
-    sysroot = subprocess.check_output(["rustc", "--print", "sysroot"], text=True).strip()
-    host = next(line.removeprefix("host: ") for line in subprocess.check_output(["rustc", "-vV"], text=True).splitlines() if line.startswith("host: "))
-    linker = Path(sysroot) / "lib/rustlib" / host / "bin/rust-lld"
-    if linker.is_file():
-        env.setdefault(f"CARGO_TARGET_{target.upper().replace('-', '_')}_LINKER", str(linker))
     run(["cargo", "build", "-p", "rbb-mkimage"], env=env)
     run(["cargo", "build", "--release", "-p", "rbb-cmds", "--bins", "--target", target], env=env)
     directory = Path(env.get("CARGO_TARGET_DIR", ROOT / "target")).absolute()

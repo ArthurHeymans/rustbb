@@ -5,6 +5,7 @@ import importlib.util
 from pathlib import Path
 import tempfile
 import unittest
+from unittest import mock
 
 SPEC = importlib.util.spec_from_file_location("qemu_harness", Path(__file__).with_name("test-qemu.py"))
 HARNESS = importlib.util.module_from_spec(SPEC)
@@ -12,6 +13,29 @@ SPEC.loader.exec_module(HARNESS)
 
 
 class HarnessTests(unittest.TestCase):
+    def compiler_environment(self, arch, variables=None, tools=("clang", "llvm-ar")):
+        with mock.patch.dict(HARNESS.os.environ, variables or {}, clear=True), \
+             mock.patch.object(HARNESS.subprocess, "check_output", side_effect=["/sysroot", "host: x86_64-unknown-linux-gnu"]), \
+             mock.patch.object(Path, "is_file", return_value=True), \
+             mock.patch.object(HARNESS.shutil, "which", side_effect=lambda name: f"/tools/{name}" if name in tools else None):
+            return HARNESS.build_environment(arch)
+
+    def test_native_tls_compiler_and_rust_linker(self):
+        env = self.compiler_environment("x86_64")
+        self.assertEqual(env["CC_x86_64_unknown_linux_musl"], "clang")
+        self.assertEqual(env["AR_x86_64_unknown_linux_musl"], "llvm-ar")
+        self.assertTrue(env["CARGO_TARGET_X86_64_UNKNOWN_LINUX_MUSL_LINKER"].endswith("/rust-lld"))
+
+    def test_cross_compiler_is_preserved_or_discovered(self):
+        env = self.compiler_environment("arm64", {"CC_aarch64_unknown_linux_musl": "/custom/cc"})
+        self.assertEqual(env["CC_aarch64_unknown_linux_musl"], "/custom/cc")
+        env = self.compiler_environment("arm64", tools=("aarch64-linux-musl-gcc",))
+        self.assertEqual(env["CC_aarch64_unknown_linux_musl"], "aarch64-linux-musl-gcc")
+
+    def test_missing_cross_compiler_does_not_use_host_cc(self):
+        with self.assertRaisesRegex(RuntimeError, "set CC_aarch64_unknown_linux_musl"):
+            self.compiler_environment("arm64")
+
     def test_architecture_selects_machine_and_console(self):
         for arch, machine, console in [("x86_64", "pc,accel=tcg", "ttyS0"), ("arm64", "virt,accel=tcg", "ttyAMA0")]:
             args = argparse.Namespace(arch=arch, qemu=HARNESS.ARCHITECTURES[arch]["qemu"])

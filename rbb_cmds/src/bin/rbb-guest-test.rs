@@ -305,6 +305,9 @@ fn run(role: &str) -> io::Result<i32> {
                 "RBB_KEXEC_SECOND_KERNEL_PASS arch={}",
                 std::env::consts::ARCH
             );
+            if let Some(proof) = command.get("rbb.netproof") {
+                println!("RBB_NETBOOT_PROOF={proof}");
+            }
             io::stdout().flush()?;
             applet("ctl", &["poweroff"])?;
         }

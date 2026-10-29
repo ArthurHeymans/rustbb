@@ -39,6 +39,32 @@ def run(command, **kwargs):
     return subprocess.run(list(map(str, command)), cwd=ROOT, check=True, **kwargs)
 
 
+def build_environment(arch):
+    """Use Rust's linker plus a target C/asm compiler for the ring TLS backend."""
+    env = os.environ.copy()
+    target = ARCHITECTURES[arch]["target"]
+    sysroot = subprocess.check_output(["rustc", "--print", "sysroot"], text=True).strip()
+    version = subprocess.check_output(["rustc", "-vV"], text=True)
+    host = next(line.removeprefix("host: ") for line in version.splitlines() if line.startswith("host: "))
+    linker = Path(sysroot) / "lib/rustlib" / host / "bin/rust-lld"
+    if linker.is_file():
+        env.setdefault(f"CARGO_TARGET_{target.upper().replace('-', '_')}_LINKER", str(linker))
+    cc_key = f"CC_{target.replace('-', '_')}"
+    if cc_key not in env and "CC" not in env:
+        candidates = [f"{ARCHITECTURES[arch]['uname']}-linux-musl-gcc", f"{ARCHITECTURES[arch]['uname']}-unknown-linux-musl-gcc"]
+        if host.split('-')[0] == ARCHITECTURES[arch]["uname"] and "linux" in host:
+            candidates += ["musl-gcc", "clang", "cc"]
+        else:
+            candidates += [f"{ARCHITECTURES[arch]['uname']}-linux-gnu-gcc", f"{ARCHITECTURES[arch]['uname']}-unknown-linux-gnu-gcc"]
+        compiler = next((candidate for candidate in candidates if shutil.which(candidate)), None)
+        if compiler is None:
+            raise RuntimeError(f"TLS backend requires a target C/asm compiler; set {cc_key}")
+        env[cc_key] = compiler
+    if shutil.which("llvm-ar"):
+        env.setdefault(f"AR_{target.replace('-', '_')}", "llvm-ar")
+    return env
+
+
 def qemu_command(args, kernel, image):
     architecture = ARCHITECTURES[args.arch]
     return list(map(str, [args.qemu, "-machine", architecture["machine"], "-cpu", architecture["cpu"], "-m", "256M", "-smp", "2",
@@ -160,15 +186,7 @@ def main():
     print(f"testing {args.arch}; kernel sha256={hashlib.sha256(kernel.read_bytes()).hexdigest()}", flush=True)
     if not shutil.which(args.qemu):
         parser.error("qemu-system-x86_64 not found")
-    env = os.environ.copy()
-    # Pure Rust+libc musl binaries need no host C toolchain. rust-lld also avoids
-    # Nix cc wrappers injecting the host ELF interpreter into the guest binary.
-    sysroot = subprocess.check_output(["rustc", "--print", "sysroot"], text=True).strip()
-    version = subprocess.check_output(["rustc", "-vV"], text=True)
-    host = next(line.removeprefix("host: ") for line in version.splitlines() if line.startswith("host: "))
-    linker = Path(sysroot) / "lib/rustlib" / host / "bin/rust-lld"
-    if linker.is_file():
-        env.setdefault(f"CARGO_TARGET_{target.upper().replace('-', '_')}_LINKER", str(linker))
+    env = build_environment(args.arch)
     run(["cargo", "build", "-p", "rbb-mkimage"], env=env)
     run(["cargo", "build", "--release", "-p", "rbb-cmds", "--bins", "--target", target], env=env)
     target_dir = Path(env.get("CARGO_TARGET_DIR", ROOT / "target"))

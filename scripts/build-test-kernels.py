@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 """Build dedicated QEMU kernels from a read-only Linux Git revision, out of tree."""
 import argparse
+from datetime import datetime, timezone
 import hashlib
 import os
 from pathlib import Path
@@ -31,6 +32,13 @@ def main():
         if not shutil.which(tool):
             parser.error(f"missing {tool}; enter a kernel build environment first")
     revision = subprocess.check_output(["git", "-C", str(args.source), "rev-parse", f"{args.revision}^{{commit}}"], text=True).strip()
+    if len(revision) not in [40, 64] or any(c not in "0123456789abcdef" for c in revision):
+        parser.error("revision did not resolve to a full Git commit hash")
+    if not 1 <= args.jobs <= 128:
+        parser.error("jobs must be 1..128")
+    epoch = subprocess.check_output(["git", "-C", str(args.source), "show", "-s", "--format=%ct", revision], text=True).strip()
+    env = os.environ.copy()
+    env.update(SOURCE_DATE_EPOCH=epoch, KBUILD_BUILD_TIMESTAMP=datetime.fromtimestamp(int(epoch), timezone.utc).strftime("%a %b %d %H:%M:%S UTC %Y"), KBUILD_BUILD_USER="rustbb", KBUILD_BUILD_HOST="qemu", KBUILD_BUILD_VERSION="1")
     artifacts = ROOT / "target/test-kernels"
     artifacts.mkdir(parents=True, exist_ok=True)
     source = artifacts / f"linux-{revision}"
@@ -51,15 +59,15 @@ def main():
         fragment.write_text((ROOT / "tests/kernels/common.config").read_text() + (ROOT / f"tests/kernels/{arch}.config").read_text())
         make_arch = "arm64" if arch == "arm64" else "x86"
         base = ["make", "-C", source, f"O={out}", f"ARCH={make_arch}", "LLVM=1", f"CC={args.cc}", f"HOSTCC={args.hostcc}", f"LD={args.ld}"]
-        run([*base, f"KCONFIG_ALLCONFIG={fragment}", "allnoconfig"])
+        run([*base, f"KCONFIG_ALLCONFIG={fragment}", "allnoconfig"], env=env)
         config = (out / ".config").read_text()
-        for feature in ["KEXEC", "KEXEC_FILE", "VIRTIO_BLK", "VIRTIO_NET", "EXT4_FS", "DEVTMPFS", "SIGNALFD"]:
+        for feature in ["KEXEC", "KEXEC_FILE", "VIRTIO_BLK", "VIRTIO_NET", "EXT4_FS", "DEVTMPFS", "SIGNALFD", "BPF", "RTC_HCTOSYS"]:
             if f"CONFIG_{feature}=y\n" not in config:
                 raise RuntimeError(f"{arch}: required {feature} not enabled")
         target = "Image" if arch == "arm64" else "bzImage"
-        run([*base, f"-j{args.jobs}", target])
+        run([*base, f"-j{args.jobs}", target], env=env)
         binary = out / ("arch/arm64/boot/Image" if arch == "arm64" else "arch/x86/boot/bzImage")
-        (out / "provenance.txt").write_text(f"Linux commit: {revision}\nKernel SHA256: {hashlib.sha256(binary.read_bytes()).hexdigest()}\nConfig SHA256: {hashlib.sha256((out / '.config').read_bytes()).hexdigest()}\n")
+        (out / "provenance.txt").write_text(f"Linux commit: {revision}\nBuild epoch: {epoch}\nKernel SHA256: {hashlib.sha256(binary.read_bytes()).hexdigest()}\nConfig SHA256: {hashlib.sha256((out / '.config').read_bytes()).hexdigest()}\n")
         print(f"KERNEL_READY arch={arch} path={binary}", flush=True)
 
 
