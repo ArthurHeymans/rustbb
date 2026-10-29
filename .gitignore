@@ -1,3 +1,5 @@
 /target/
 tools
 __pycache__/
+/vendor/mozim/Cargo.lock
+/vendor/mozim/target/
