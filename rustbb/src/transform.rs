@@ -56,7 +56,14 @@ impl Scope {
 
     fn resolve(&self, path: &Path, module: &[String]) -> String {
         let mut parts: Vec<String> = path.segments.iter().map(|s| s.ident.to_string()).collect();
-        if let Some(import) = parts.first().and_then(|n| self.imports.get(n)) {
+        let mut seen = HashSet::new();
+        while let Some(name) = parts.first() {
+            if !seen.insert(name.clone()) {
+                break;
+            }
+            let Some(import) = self.imports.get(name) else {
+                break;
+            };
             let mut expanded: Vec<_> = import.split("::").map(str::to_owned).collect();
             expanded.extend(parts.into_iter().skip(1));
             parts = expanded;
@@ -84,13 +91,36 @@ impl Scope {
     }
 }
 
-/// Index only types with a verified clap Parser derive, not every type named Args.
-pub fn collect_parsers(
-    source: &str,
-    module: &[String],
-    parsers: &mut HashSet<String>,
-) -> Result<()> {
-    fn collect(items: &[Item], module: &[String], parsers: &mut HashSet<String>) {
+/// Local type aliases must eventually reach a verified derive. Cycles and
+/// aliases to unrelated types never establish clap parser identity.
+#[derive(Default)]
+pub struct ParserIndex {
+    derived: HashSet<String>,
+    aliases: HashMap<String, String>,
+}
+
+impl ParserIndex {
+    fn is_parser(&self, name: &str) -> bool {
+        let mut current = name;
+        let mut seen = HashSet::new();
+        loop {
+            if self.derived.contains(current) {
+                return true;
+            }
+            if !seen.insert(current) {
+                return false;
+            }
+            let Some(target) = self.aliases.get(current) else {
+                return false;
+            };
+            current = target;
+        }
+    }
+}
+
+/// Index only types with a verified clap Parser derive, and aliases to them.
+pub fn collect_parsers(source: &str, module: &[String], parsers: &mut ParserIndex) -> Result<()> {
+    fn collect(items: &[Item], module: &[String], parsers: &mut ParserIndex) {
         let scope = Scope::new(items);
         for item in items {
             let declaration = match item {
@@ -113,7 +143,18 @@ pub fn collect_parsers(
                 if is_parser {
                     let mut path = module.to_vec();
                     path.push(ident.to_string());
-                    parsers.insert(path.join("::"));
+                    parsers.derived.insert(path.join("::"));
+                }
+            }
+            if let Item::Type(alias) = item {
+                if let syn::Type::Path(target) = &*alias.ty {
+                    if target.qself.is_none() {
+                        let mut path = module.to_vec();
+                        path.push(alias.ident.to_string());
+                        parsers
+                            .aliases
+                            .insert(path.join("::"), scope.resolve(&target.path, module));
+                    }
                 }
             }
             if let Item::Mod(m) = item {
@@ -135,7 +176,7 @@ pub fn collect_parsers(
 pub fn transform_source(
     source: &str,
     module: &[String],
-    parsers: &HashSet<String>,
+    parsers: &ParserIndex,
     entry: bool,
 ) -> Result<String> {
     let mut file = parse_file(source).context("Cannot parse command source")?;
@@ -192,7 +233,7 @@ pub fn transform_source(
 }
 
 struct ArgumentTransformer<'a> {
-    parsers: &'a HashSet<String>,
+    parsers: &'a ParserIndex,
     module: Vec<String>,
     scope: Scope,
     error: Option<String>,
@@ -225,7 +266,7 @@ impl ArgumentTransformer<'_> {
         if !qualified_trait
             && !self
                 .parsers
-                .contains(&self.scope.resolve(&path, &self.module))
+                .is_parser(&self.scope.resolve(&path, &self.module))
         {
             return None;
         }
@@ -355,7 +396,7 @@ impl VisitMut for ArgumentTransformer<'_> {
 mod tests {
     use super::*;
     fn transform(source: &str) -> String {
-        let mut parsers = HashSet::new();
+        let mut parsers = ParserIndex::default();
         collect_parsers(source, &[], &mut parsers).unwrap();
         transform_source(source, &[], &parsers, true).unwrap()
     }
@@ -385,7 +426,7 @@ mod tests {
         assert!(transform_source(
             "fn main() { custom!(std::env::args()); }",
             &[],
-            &HashSet::new(),
+            &ParserIndex::default(),
             true
         )
         .is_err());
@@ -397,6 +438,23 @@ mod tests {
         assert!(result.contains("rustbb_runtime::args_os()"));
         assert!(result.contains("<Options as clap::Parser>::parse_from"));
         assert!(result.contains("clap::Parser::parse_from"));
+    }
+    #[test]
+    fn follows_chained_generic_aliases_without_rewriting_unrelated_types() {
+        let result = transform("use clap as cli; use cli::Parser; #[derive(Parser)] struct Args<T>{value:T} type First<T>=Args<T>; type Options=First<String>; struct Config; type Other=Config; fn main(){let _=Options::parse(); let _=Other::parse();}");
+        assert!(result.contains("Options::parse_from(rustbb_runtime::args_os())"));
+        assert!(result.contains("Other::parse()"));
+    }
+    #[test]
+    fn import_and_type_alias_cycles_terminate_without_becoming_parsers() {
+        let source = "use b as a; use a as b; type A=B; type B=A; fn main(){}";
+        let file = parse_file(source).unwrap();
+        let scope = Scope::new(&file.items);
+        assert_eq!(scope.resolve(&parse_quote!(a), &[]), "a");
+        let mut index = ParserIndex::default();
+        collect_parsers(source, &[], &mut index).unwrap();
+        assert!(!index.is_parser("A"));
+        assert!(!index.is_parser("B"));
     }
     #[test]
     fn verifies_module_and_import_aliases() {

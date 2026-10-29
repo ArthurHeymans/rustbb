@@ -35,7 +35,7 @@ pub fn build(
         let dest = generated.path().join(format!("commands/{index}"));
         copy_package(&info.path, &dest)?;
         let sources = collect_sources(&info.path, &info.main_path)?;
-        let mut parsers = HashSet::new();
+        let mut parsers = transform::ParserIndex::default();
         for source in &sources {
             transform::collect_parsers(&source.text, &source.module, &mut parsers)?;
         }
@@ -59,6 +59,7 @@ pub fn build(
             enabled_features,
             no_default_features,
         )?;
+        prepare_build_script(info, &dest)?;
         fs::write(dest.join("Cargo.toml"), toml::to_string_pretty(&manifest)?)?;
         println!("  ✓ {}", info.name);
     }
@@ -128,6 +129,84 @@ struct SourceFile {
     text: String,
 }
 
+/// Supply binary-only Cargo metadata to the wrapper's compiler, including
+/// macro expansions and OUT_DIR includes. Inject into the existing build main
+/// without changing its signature, control flow, module paths or return value.
+fn prepare_build_script(info: &discovery::CrateInfo, dest: &Path) -> Result<()> {
+    let path = dest.join(codegen::build_script_path(info)?);
+    let text = if info.build_script.is_some() {
+        fs::read_to_string(&path)?
+    } else {
+        anyhow::ensure!(
+            !path.exists(),
+            "Input uses reserved rustbb_build_metadata.rs path"
+        );
+        "fn main() {}".to_owned()
+    };
+    let mut script = syn::parse_file(&text).context("Cannot parse original build script")?;
+    let binary_name = &info.binary_name;
+    let mut found = false;
+    for item in &mut script.items {
+        if let Item::Fn(function) = item {
+            if function.sig.ident == "main" {
+                function.block.stmts.insert(
+                    0,
+                    syn::parse_quote! {
+                        ::std::println!("cargo:rustc-env=CARGO_BIN_NAME={}", #binary_name);
+                    },
+                );
+                found = true;
+            }
+        }
+    }
+    anyhow::ensure!(
+        found,
+        "Build script has no explicit main function; cannot supply binary metadata"
+    );
+    fs::write(path, prettyplease::unparse(&script))?;
+    Ok(())
+}
+
+/// Consider every literal path that cfg_attr can select. Predicates may come
+/// from build scripts or cross-compilation, so host-only cfg evaluation is unsafe.
+fn module_paths(attrs: &[syn::Attribute]) -> Result<(Vec<PathBuf>, bool)> {
+    fn collect(
+        meta: &Meta,
+        conditional: bool,
+        paths: &mut Vec<PathBuf>,
+        explicit: &mut bool,
+    ) -> Result<()> {
+        match meta {
+            Meta::NameValue(value) if value.path.is_ident("path") => {
+                let syn::Expr::Lit(literal) = &value.value else {
+                    anyhow::bail!("Module path must be a string literal");
+                };
+                let Lit::Str(path) = &literal.lit else {
+                    anyhow::bail!("Module path must be a string literal");
+                };
+                paths.push(PathBuf::from(path.value()));
+                *explicit |= !conditional;
+            }
+            Meta::List(list) if list.path.is_ident("cfg_attr") => {
+                let values = list.parse_args_with(
+                    syn::punctuated::Punctuated::<Meta, syn::Token![,]>::parse_terminated,
+                )?;
+                for value in values.iter().skip(1) {
+                    collect(value, true, paths, explicit)?;
+                }
+            }
+            _ => (),
+        }
+        Ok(())
+    }
+    let mut paths = Vec::new();
+    let mut explicit = false;
+    for attr in attrs {
+        collect(&attr.meta, false, &mut paths, &mut explicit)?;
+    }
+    Ok((paths, explicit))
+}
+
 /// Walk the actual module tree, including #[path] and inline modules. Every
 /// reachable command module gets the same AST transformation as the entry file.
 fn collect_sources(root: &Path, entry: &Path) -> Result<Vec<SourceFile>> {
@@ -143,56 +222,51 @@ fn collect_sources(root: &Path, entry: &Path) -> Result<Vec<SourceFile>> {
             if let Item::Mod(m) = item {
                 let mut path = module.to_vec();
                 path.push(m.ident.to_string());
+                let (locations, explicit) = module_paths(&m.attrs)?;
+                let conditional = m
+                    .attrs
+                    .iter()
+                    .any(|a| a.path().is_ident("cfg") || a.path().is_ident("cfg_attr"));
+                let mut candidates: Vec<_> = locations.iter().map(|p| dir.join(p)).collect();
                 if let Some((_, items)) = &m.content {
-                    visit_items(
-                        root,
-                        items,
-                        &dir.join(m.ident.to_string()),
-                        &path,
-                        sources,
-                        active,
-                    )?;
+                    if !explicit {
+                        candidates.push(dir.join(m.ident.to_string()));
+                    }
+                    candidates.sort();
+                    candidates.dedup();
+                    for candidate in candidates {
+                        if conditional && !candidate.exists() {
+                            continue;
+                        }
+                        visit_items(root, items, &candidate, &path, sources, active)?;
+                    }
                 } else {
-                    let explicit =
-                        m.attrs
-                            .iter()
-                            .find(|a| a.path().is_ident("path"))
-                            .and_then(|a| {
-                                if let Meta::NameValue(value) = &a.meta {
-                                    if let syn::Expr::Lit(lit) = &value.value {
-                                        if let Lit::Str(path) = &lit.lit {
-                                            return Some(path.value());
-                                        }
-                                    }
-                                }
-                                None
-                            });
-                    let file = if let Some(explicit) = explicit {
-                        dir.join(explicit)
-                    } else {
+                    if !explicit {
                         let flat = dir.join(format!("{}.rs", m.ident));
-                        if flat.exists() {
+                        candidates.push(if flat.exists() {
                             flat
                         } else {
                             dir.join(m.ident.to_string()).join("mod.rs")
-                        }
-                    };
-                    if !file.exists()
-                        && m.attrs
-                            .iter()
-                            .any(|a| a.path().is_ident("cfg") || a.path().is_ident("cfg_attr"))
-                    {
-                        continue; // Cargo diagnoses a missing module if its cfg is active.
+                        });
                     }
-                    let file = file
-                        .canonicalize()
-                        .with_context(|| format!("Cannot locate module {}", file.display()))?;
-                    let children = if file.file_name().is_some_and(|n| n == "mod.rs") {
-                        file.parent().unwrap().to_path_buf()
-                    } else {
-                        file.with_extension("")
-                    };
-                    visit_file(root, &file, &children, &path, sources, active)?;
+                    candidates.sort();
+                    candidates.dedup();
+                    for file in candidates {
+                        if conditional && !file.exists() {
+                            // All literal conditional paths are considered. Cargo
+                            // will reject a missing file if that branch is active.
+                            continue;
+                        }
+                        let file = file
+                            .canonicalize()
+                            .with_context(|| format!("Cannot locate module {}", file.display()))?;
+                        let children = if file.file_name().is_some_and(|n| n == "mod.rs") {
+                            file.parent().unwrap().to_path_buf()
+                        } else {
+                            file.with_extension("")
+                        };
+                        visit_file(root, &file, &children, &path, sources, active)?;
+                    }
                 }
             }
         }

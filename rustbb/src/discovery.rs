@@ -10,6 +10,8 @@ pub struct CrateInfo {
     pub name: String,
     pub path: PathBuf,
     pub main_path: PathBuf,
+    pub binary_name: String,
+    pub build_script: Option<PathBuf>,
     pub library_name: Option<String>,
     pub manifest: toml::Value,
     pub workspace_root: PathBuf,
@@ -62,12 +64,16 @@ pub fn analyze_crate(path: &Path) -> Result<CrateInfo> {
         target["src_path"]
             .as_str()
             .context("Missing binary source path")?,
-    );
+    )
+    .canonicalize()
+    .context("Cannot locate binary source")?;
     let package_manifest = PathBuf::from(
         package["manifest_path"]
             .as_str()
             .context("Missing manifest path")?,
-    );
+    )
+    .canonicalize()
+    .context("Cannot locate package manifest")?;
     let path = package_manifest
         .parent()
         .context("Invalid manifest path")?
@@ -88,6 +94,19 @@ pub fn analyze_crate(path: &Path) -> Result<CrateInfo> {
         })
         .and_then(|t| t["name"].as_str())
         .map(str::to_owned);
+    let build_script = package["targets"]
+        .as_array()
+        .context("Missing targets")?
+        .iter()
+        .find(|t| {
+            t["kind"]
+                .as_array()
+                .is_some_and(|k| k.iter().any(|v| v == "custom-build"))
+        })
+        .and_then(|t| t["src_path"].as_str())
+        .map(|p| Path::new(p).canonicalize())
+        .transpose()
+        .context("Cannot locate build script")?;
     Ok(CrateInfo {
         name: package["name"]
             .as_str()
@@ -95,6 +114,11 @@ pub fn analyze_crate(path: &Path) -> Result<CrateInfo> {
             .to_owned(),
         path,
         main_path,
+        binary_name: target["name"]
+            .as_str()
+            .context("Missing binary target name")?
+            .to_owned(),
+        build_script,
         library_name,
         manifest: read_manifest(&package_manifest)?,
         workspace_manifest: read_manifest(&workspace_root.join("Cargo.toml"))?,

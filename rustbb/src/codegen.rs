@@ -59,6 +59,15 @@ pub fn command_manifest(
     }
     package.remove("workspace");
     package.remove("default-run");
+    if info.library_name.is_some() {
+        // The original library alone owns its native-link identity. The copied
+        // build script still runs for binary-specific generated files and cfgs.
+        package.remove("links");
+    }
+    package.insert(
+        "build".into(),
+        Value::String(build_script_path(info)?.to_string_lossy().into_owned()),
+    );
     package.insert(
         "name".into(),
         Value::String(command_package_name(info, index)),
@@ -127,6 +136,16 @@ pub fn command_manifest(
         deps.insert(library_name.clone(), dep);
     }
     Ok(doc)
+}
+
+pub fn build_script_path(info: &CrateInfo) -> Result<std::path::PathBuf> {
+    match &info.build_script {
+        Some(path) => Ok(path
+            .strip_prefix(&info.path)
+            .context("Build script is outside the package")?
+            .to_path_buf()),
+        None => Ok(std::path::PathBuf::from("rustbb_build_metadata.rs")),
+    }
 }
 
 fn inherited(value: &Value) -> bool {
@@ -346,6 +365,8 @@ mod tests {
             name: "app".into(),
             path: PathBuf::from("/ws/app"),
             main_path: PathBuf::from("/ws/app/src/main.rs"),
+            binary_name: "app".into(),
+            build_script: None,
             library_name: None,
             manifest: toml::from_str(manifest).unwrap(),
             workspace_root: PathBuf::from("/ws"),

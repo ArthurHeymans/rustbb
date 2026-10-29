@@ -56,9 +56,9 @@ rustbb uses AST transformation (via `syn` and `quote`) to:
 
 1. **Discover** binary targets and workspace roots using Cargo metadata
 2. **Copy** each command into a separate generated library crate, preserving its feature graph
-3. **Replace** `std::env::args()` / `args_os()` in the binary's module tree and supported macro arguments
-4. **Transform** verified local clap `Parser` derives' `parse()` / `try_parse()` calls to explicit-argument variants
-5. **Preserve** `main()` return types and async attributes, including Tokio runtime options
+3. **Replace** `std::env::args()` / `args_os()` in the binary's module tree (including conditional paths) and supported macro arguments
+4. **Transform** verified local clap `Parser` derives' and type aliases' `parse()` / `try_parse()` calls to explicit-argument variants
+5. **Preserve** `main()` return types, async attributes, and binary-target metadata, including Tokio runtime options and `CARGO_BIN_NAME`
 6. **Resolve** workspace inheritance without changing dependency sources or version constraints
 7. **Generate** a dispatcher that preserves each command's `Termination` result
 8. **Build** the combined binary using Cargo
@@ -171,7 +171,8 @@ busyboxide/
 - Global state in commands may conflict; Cargo still unifies features of shared dependency packages normally.
 - Argument access in third-party libraries is not rewritten. Clap rewriting requires a verifiable local `Parser` derive or an explicitly qualified `clap::Parser` call.
 - Argument access inside unsupported custom macros is rejected with a diagnostic; move the expression outside the macro. Standard formatting, assertion, `vec!`, and `dbg!` macros are supported.
-- Source modules outside the package and symlinked package files are rejected rather than copied ambiguously.
+- Source modules outside the package and symlinked package files are rejected rather than copied ambiguously. Conditional module paths are analyzed conservatively, including inactive candidate files.
+- Existing build scripts must have an explicit `main()` so rustbb can supply binary-target metadata without changing their return semantics.
 - Commands with an existing library need an internally named wrapper package to avoid Cargo identity collisions; the binary's compile-time `CARGO_PKG_NAME` then reflects that wrapper name. Binary-only packages retain their original package metadata.
 
 ## Source Trust and Caching

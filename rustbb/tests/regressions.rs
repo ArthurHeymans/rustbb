@@ -202,6 +202,96 @@ fn rewrites_only_verified_clap_parsers_in_external_modules() {
     assert_eq!(stdout(&output), "payload");
 }
 
+#[test]
+fn review_chained_imports_keep_arguments_and_clap_parsing_correct() {
+    let f = Fixture::new();
+    f.package("chainargs", "use std::env; use env::args; fn main(){println!(\"{:?}\",args().skip(1).collect::<Vec<_>>());}", "");
+    f.package("chainclap", "use clap as c; use c::Parser; #[derive(Parser)] struct Cli{value:String} fn main(){println!(\"{}\",Cli::parse().value);}", "[dependencies]\nclap={version='4',features=['derive']}");
+    let binary = f.build(&["chainargs", "chainclap"], &[]);
+    assert_eq!(
+        stdout(&run(&binary, "chainargs", &["payload"])),
+        "[\"payload\"]"
+    );
+    let output = run(&binary, "chainclap", &["payload"]);
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert_eq!(stdout(&output), "payload");
+}
+
+#[test]
+fn review_local_type_aliases_resolve_to_verified_clap_parsers_only() {
+    let f = Fixture::new();
+    f.package("aliasclap", "use clap::Parser; mod cli; use cli::Options; struct Config; impl Config{fn parse()->Self{Self}} type Unrelated=Config; fn main(){let _=Unrelated::parse(); let args=Options::parse(); println!(\"{}\",args.value);}", "[dependencies]\nclap={version='4',features=['derive']}");
+    f.file("aliasclap/src/cli.rs", "use clap::Parser; #[derive(Parser)] pub struct Cli{pub value:String} type First=Cli; pub type Options=First;");
+    let binary = f.build(&["aliasclap"], &[]);
+    let output = run(&binary, "aliasclap", &["payload"]);
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert_eq!(stdout(&output), "payload");
+}
+
+#[test]
+fn review_conditional_module_paths_are_transformed() {
+    let f = Fixture::new();
+    f.package("conditional", "#[cfg_attr(all(),cfg_attr(unix,path=\"unix.rs\"))] #[cfg_attr(not(unix),path=\"other.rs\")] mod platform; fn main(){platform::run();}", "");
+    for path in ["unix.rs", "other.rs"] {
+        f.file(
+            &format!("conditional/src/{path}"),
+            "pub fn run(){println!(\"{:?}\",std::env::args().skip(1).collect::<Vec<_>>());}",
+        );
+    }
+    let binary = f.build(&["conditional"], &[]);
+    assert_eq!(
+        stdout(&run(&binary, "conditional", &["payload"])),
+        "[\"payload\"]"
+    );
+}
+
+#[test]
+fn review_native_link_ownership_stays_with_the_original_library() {
+    let f = Fixture::new();
+    f.package(
+        "nativefixture",
+        "fn main(){println!(\"{}\",nativefixture::value());}",
+        "links='fixture_native'",
+    );
+    f.file("nativefixture/src/lib.rs", "pub fn value()->u32{42}");
+    f.file("nativefixture/build.rs", "fn main(){}");
+    let binary = f.build(&["nativefixture"], &[]);
+    assert_eq!(stdout(&run(&binary, "nativefixture", &[])), "42");
+}
+
+#[test]
+fn review_binary_name_metadata_survives_library_compilation() {
+    let f = Fixture::new();
+    f.package("binarymeta", "mod helper; fn main(){println!(\"{} {}\",env!(\"CARGO_BIN_NAME\"),helper::optional().unwrap());}", "[[bin]]\nname='original-target'\npath='src/main.rs'");
+    f.file(
+        "binarymeta/src/helper.rs",
+        "pub fn optional()->Option<&'static str>{option_env!(\"CARGO_BIN_NAME\")}",
+    );
+    f.package("binaryscript", "include!(concat!(env!(\"OUT_DIR\"),\"/name.rs\")); fn main(){println!(\"{} {}\",BINARY,option_env!(\"CARGO_BIN_NAME\").unwrap());}", "build='build/custom.rs'");
+    f.file(
+        "binaryscript/build/custom.rs",
+        "mod helper; fn main()->std::io::Result<()>{helper::emit()?;Ok(())}",
+    );
+    f.file("binaryscript/build/helper.rs", "pub fn emit()->std::io::Result<()>{std::fs::write(std::path::PathBuf::from(std::env::var_os(\"OUT_DIR\").unwrap()).join(\"name.rs\"),\"const BINARY:&str=env!(\\\"CARGO_BIN_NAME\\\");\")}");
+    let binary = f.build(&["binarymeta", "binaryscript"], &[]);
+    assert_eq!(
+        stdout(&run(&binary, "binarymeta", &[])),
+        "original-target original-target"
+    );
+    assert_eq!(
+        stdout(&run(&binary, "binaryscript", &[])),
+        "binaryscript binaryscript"
+    );
+}
+
 fn git(path: &Path, args: &[&str]) {
     checked(Command::new("git").arg("-C").arg(path).args(args));
 }
