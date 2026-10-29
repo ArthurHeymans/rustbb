@@ -79,30 +79,18 @@ fn main() -> Result<()> {
 
     match cli.command {
         Commands::Analyze { sources } => {
-            let cache_dir = std::env::temp_dir().join("rustbb-cache");
-            std::fs::create_dir_all(&cache_dir)?;
+            let cache_dir = fetch::default_cache_dir()?;
 
             for source_str in sources {
                 let source = CrateSource::parse(&source_str)?;
                 println!("Source: {}", source.display_name());
 
-                match fetch::fetch_crate(&source, &cache_dir) {
-                    Ok(fetched) => match discovery::analyze_crate(&fetched.path) {
-                        Ok(info) => {
-                            println!("  Crate: {}", info.name);
-                            println!("  Path: {}", info.path.display());
-                            println!("  Main: {}", info.main_path.display());
-                            println!("  Strategy: {:?}", info.strategy);
-                            println!("  Dependencies: {:?}", info.dependencies);
-                        }
-                        Err(e) => {
-                            eprintln!("  Error analyzing: {}", e);
-                        }
-                    },
-                    Err(e) => {
-                        eprintln!("  Error fetching: {}", e);
-                    }
-                }
+                let fetched = fetch::fetch_crate(&source, &cache_dir)?;
+                let info = discovery::analyze_crate(&fetched.path)?;
+                println!("  Crate: {}", info.name);
+                println!("  Path: {}", info.path.display());
+                println!("  Main: {}", info.main_path.display());
+                println!("  Dependencies: {:?}", info.manifest.get("dependencies"));
                 println!();
             }
         }
@@ -114,8 +102,7 @@ fn main() -> Result<()> {
             features,
             no_default_features,
         } => {
-            let cache_dir = cache_dir.unwrap_or_else(|| std::env::temp_dir().join("rustbb-cache"));
-            std::fs::create_dir_all(&cache_dir)?;
+            let cache_dir = cache_dir.map(Ok).unwrap_or_else(fetch::default_cache_dir)?;
 
             // Parse and fetch all crate sources
             println!("Fetching crates...");
@@ -125,16 +112,9 @@ fn main() -> Result<()> {
                 let source = CrateSource::parse(source_str)?;
                 print!("  {} ... ", source.display_name());
 
-                match fetch::fetch_crate(&source, &cache_dir) {
-                    Ok(fetched) => {
-                        println!("ok ({})", fetched.name);
-                        fetched_crates.push(fetched);
-                    }
-                    Err(e) => {
-                        println!("FAILED");
-                        eprintln!("    Error: {}", e);
-                    }
-                }
+                let fetched = fetch::fetch_crate(&source, &cache_dir)?;
+                println!("ok ({})", fetched.name);
+                fetched_crates.push(fetched);
             }
 
             if fetched_crates.is_empty() {
@@ -146,7 +126,13 @@ fn main() -> Result<()> {
 
             // Parse features
             let enabled_features: Vec<String> = features
-                .map(|f| f.split(',').map(|s| s.trim().to_string()).collect())
+                .map(|f| {
+                    f.split(',')
+                        .map(str::trim)
+                        .filter(|s| !s.is_empty())
+                        .map(str::to_owned)
+                        .collect()
+                })
                 .unwrap_or_default();
 
             // Build

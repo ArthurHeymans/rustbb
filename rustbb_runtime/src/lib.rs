@@ -6,6 +6,7 @@
 use std::collections::HashMap;
 use std::ffi::OsString;
 use std::path::Path;
+use std::process::ExitCode;
 use std::sync::Mutex;
 
 // Global storage for the effective arguments.
@@ -63,7 +64,7 @@ impl Drop for ArgsGuard {
 /// Function signature for command entry points.
 ///
 /// Commands should return an exit code (0 for success, non-zero for errors).
-pub type CommandFn = fn() -> i32;
+pub type CommandFn = fn() -> ExitCode;
 
 /// Registry of available commands.
 ///
@@ -102,7 +103,7 @@ impl Registry {
     ///
     /// Returns `Some(exit_code)` if the command was found and executed,
     /// `None` if no command with that name exists.
-    pub fn try_run(&self, name: &str) -> Option<i32> {
+    pub fn try_run(&self, name: &str) -> Option<ExitCode> {
         self.commands.get(name).map(|cmd| cmd())
     }
 
@@ -111,7 +112,7 @@ impl Registry {
     /// This sets up the effective arguments before calling the command,
     /// so that `rustbb_runtime::args()` returns the correct values.
     /// The args are visible to all threads spawned by the command.
-    pub fn try_run_with_args(&self, name: &str, args: Vec<OsString>) -> Option<i32> {
+    pub fn try_run_with_args(&self, name: &str, args: Vec<OsString>) -> Option<ExitCode> {
         self.commands.get(name).map(|cmd| {
             set_effective_args(args);
             let _guard = ArgsGuard; // clears args on drop, even if cmd() panics
@@ -143,8 +144,8 @@ impl Default for Registry {
 /// ./rustbb cat file.txt  # Runs the "cat" command
 /// ```
 ///
-/// This function never returns - it exits the process with the command's exit code.
-pub fn dispatch(registry: &Registry) -> ! {
+/// Return this value from main to preserve the command's Termination result.
+pub fn dispatch(registry: &Registry) -> ExitCode {
     let args: Vec<OsString> = std::env::args_os().collect();
     let args_str: Vec<String> = args
         .iter()
@@ -165,7 +166,7 @@ pub fn dispatch(registry: &Registry) -> ! {
         // Symlink mode - args are already correct
         let effective_args = args.clone();
         if let Some(exit_code) = registry.try_run_with_args(binary_name, effective_args) {
-            std::process::exit(exit_code);
+            return exit_code;
         }
     }
 
@@ -177,7 +178,7 @@ pub fn dispatch(registry: &Registry) -> ! {
         // Check for help flags
         if cmd_name == "--help" || cmd_name == "-h" {
             print_help(binary_name, registry);
-            std::process::exit(0);
+            return ExitCode::SUCCESS;
         }
 
         // Check for list command
@@ -185,7 +186,7 @@ pub fn dispatch(registry: &Registry) -> ! {
             for cmd in registry.list() {
                 println!("{}", cmd);
             }
-            std::process::exit(0);
+            return ExitCode::SUCCESS;
         }
 
         if registry.get(cmd_name).is_some() {
@@ -193,7 +194,7 @@ pub fn dispatch(registry: &Registry) -> ! {
             // instead of ["mybox", "cmd", "arg1", "arg2", ...]
             let effective_args: Vec<OsString> = args[1..].to_vec();
             if let Some(exit_code) = registry.try_run_with_args(cmd_name, effective_args) {
-                std::process::exit(exit_code);
+                return exit_code;
             }
         }
 
@@ -201,12 +202,12 @@ pub fn dispatch(registry: &Registry) -> ! {
         eprintln!("Unknown command: {}", cmd_name);
         eprintln!();
         print_help(binary_name, registry);
-        std::process::exit(1);
+        return ExitCode::FAILURE;
     }
 
     // No command specified - show help
     print_help(binary_name, registry);
-    std::process::exit(1);
+    ExitCode::FAILURE
 }
 
 fn print_help(binary_name: &str, registry: &Registry) {
@@ -229,8 +230,8 @@ mod tests {
 
     #[test]
     fn test_registry_basic() {
-        fn test_cmd() -> i32 {
-            42
+        fn test_cmd() -> ExitCode {
+            ExitCode::from(42)
         }
 
         let mut registry = Registry::new();
@@ -238,16 +239,16 @@ mod tests {
 
         assert!(registry.get("test").is_some());
         assert!(registry.get("nonexistent").is_none());
-        assert_eq!(registry.try_run("test"), Some(42));
+        assert_eq!(registry.try_run("test"), Some(ExitCode::from(42)));
     }
 
     #[test]
     fn test_registry_list() {
-        fn cmd_a() -> i32 {
-            0
+        fn cmd_a() -> ExitCode {
+            ExitCode::SUCCESS
         }
-        fn cmd_b() -> i32 {
-            0
+        fn cmd_b() -> ExitCode {
+            ExitCode::SUCCESS
         }
 
         let mut registry = Registry::new();

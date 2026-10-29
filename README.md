@@ -10,7 +10,7 @@
 - **Symlink and subcommand modes** - Invoke commands via symlinks (`./cat file`) or subcommands (`./busybox cat file`)
 - **Automatic argument handling** - Transforms `std::env::args()` and `clap::Parser::parse()` calls
 - **Async runtime support** - Handles `#[tokio::main]` and `#[async_std::main]` automatically
-- **Dependency merging** - Combines dependencies with proper version and feature handling
+- **Dependency isolation** - Preserves each command's dependency sources, aliases, versions, and Cargo feature graph
 - **Size optimization** - Release builds with LTO produce compact binaries
 
 ## Quick Start
@@ -45,7 +45,7 @@ rustbb supports multiple ways to specify crates:
 |--------|-------------|---------|
 | `./path` | Local filesystem path | `./my-cli` |
 | `crate_name` | Latest version from crates.io | `hexyl` |
-| `crate@version` | Specific version from crates.io | `hexyl@0.14` |
+| `crate@version` | Cargo version requirement from crates.io (`=x.y.z` for exact) | `hexyl@0.14` |
 | `github:user/repo` | GitHub repository (main branch) | `github:sharkdp/bat` |
 | `github:user/repo#ref` | GitHub repository at tag/branch | `github:sharkdp/bat#v0.24.0` |
 | `git:url` | Any git repository | `git:https://gitlab.com/user/repo.git` |
@@ -54,14 +54,14 @@ rustbb supports multiple ways to specify crates:
 
 rustbb uses AST transformation (via `syn` and `quote`) to:
 
-1. **Analyze** each input crate's `main.rs` to determine transformation strategy
-2. **Transform** the `main()` function into a callable library function
-3. **Replace** calls to `std::env::args()` with `rustbb_runtime::args()` for proper argument handling
-4. **Transform** `clap::Parser::parse()` to `parse_from(rustbb_runtime::args_os())`
-5. **Handle async** by wrapping `#[tokio::main]` bodies with runtime builders
-6. **Merge** dependencies from all crates with proper version and feature handling
-7. **Generate** a combined crate with a dispatcher that routes to the correct command
-8. **Build** the combined binary using cargo
+1. **Discover** binary targets and workspace roots using Cargo metadata
+2. **Copy** each command into a separate generated library crate, preserving its feature graph
+3. **Replace** `std::env::args()` / `args_os()` in the binary's module tree and supported macro arguments
+4. **Transform** verified local clap `Parser` derives' `parse()` / `try_parse()` calls to explicit-argument variants
+5. **Preserve** `main()` return types and async attributes, including Tokio runtime options
+6. **Resolve** workspace inheritance without changing dependency sources or version constraints
+7. **Generate** a dispatcher that preserves each command's `Termination` result
+8. **Build** the combined binary using Cargo
 
 ### Transformation Examples
 
@@ -74,12 +74,13 @@ fn main() {
 }
 
 // Transformed
-pub fn rustbb_cmd_echo() -> i32 {
-    (|| {
-        let args: Vec<String> = rustbb_runtime::args().skip(1).collect();
-        println!("{}", args.join(" "));
-    })();
-    0i32
+fn main() {
+    let args: Vec<String> = rustbb_runtime::args().skip(1).collect();
+    println!("{}", args.join(" "));
+}
+
+pub fn rustbb_entry() -> std::process::ExitCode {
+    std::process::Termination::report(main())
 }
 ```
 
@@ -105,14 +106,14 @@ async fn main() {
     do_async_stuff().await;
 }
 
-// Transformed - runtime created explicitly
-pub fn rustbb_cmd_async() -> i32 {
-    tokio::runtime::Runtime::new()
-        .expect("Failed to create Tokio runtime")
-        .block_on(async {
-            do_async_stuff().await;
-        });
-    0i32
+// Transformed - Tokio expands the original attribute with its original options
+#[tokio::main]
+async fn main() {
+    do_async_stuff().await;
+}
+
+pub fn rustbb_entry() -> std::process::ExitCode {
+    std::process::Termination::report(main())
 }
 ```
 
@@ -153,9 +154,9 @@ busyboxide/
 |--------|----------------|---------------|
 | Transformation | AST rewrite of package/main/init | AST rewrite of main + args + clap |
 | Registration | Runtime via init() | Build-time code generation |
-| Argument handling | argv manipulation | Thread-local + runtime function |
+| Argument handling | argv manipulation | Process-wide effective arguments + runtime function |
 | Async support | N/A (goroutines) | ✅ tokio & async_std |
-| Dependency handling | Copy to temp GOPATH | Merge Cargo.toml with features |
+| Dependency handling | Copy to temp GOPATH | Separate command crates with preserved Cargo manifests |
 
 ## Binary Sizes (Release, stripped)
 
@@ -167,18 +168,28 @@ busyboxide/
 
 ## Limitations
 
-- Global state in commands may conflict
-- Some complex macro patterns may not transform correctly
-- Version conflicts between dependencies use first-seen version
+- Global state in commands may conflict; Cargo still unifies features of shared dependency packages normally.
+- Argument access in third-party libraries is not rewritten. Clap rewriting requires a verifiable local `Parser` derive or an explicitly qualified `clap::Parser` call.
+- Argument access inside unsupported custom macros is rejected with a diagnostic; move the expression outside the macro. Standard formatting, assertion, `vec!`, and `dbg!` macros are supported.
+- Source modules outside the package and symlinked package files are rejected rather than copied ambiguously.
+- Commands with an existing library need an internally named wrapper package to avoid Cargo identity collisions; the binary's compile-time `CARGO_PKG_NAME` then reflects that wrapper name. Binary-only packages retain their original package metadata.
+
+## Source Trust and Caching
+
+Building Rust source can execute build scripts and procedural macros. Only build sources you trust; rustbb is not a sandbox.
+
+Remote sources use fresh, randomly named working directories under the user's `rustbb` cache directory (or `--cache-dir`). On Unix, symlinked, foreign-owned, or group/world-writable cache locations are rejected. Legacy `/tmp/rustbb-cache` checkouts are never reused. Cargo's metadata and lockfile identify the exact registry package selected by its resolver; binary-only packages are vendored from that locked resolution and checksum-checked. Rustbb does not scan registry directories for matching names.
+
+Workspace dependency inheritance preserves Git revisions, registries, aliases, paths, and feature settings. Unresolvable inheritance and conflicting workspace patches fail instead of falling back to crates.io or wildcard versions. Requested fetch/build failures also fail the overall build instead of silently omitting commands.
 
 ## Future Work
 
 - [x] Async runtime support
-- [x] Dependency version/feature merging
+- [x] Dependency source and feature preservation
 - [ ] Library interface detection and use
 - [ ] Feature flags for selective command inclusion
-- [ ] Smarter version conflict resolution
-- [ ] Integration tests
+- [x] Cargo-managed version resolution
+- [x] Integration and adversarial regression tests
 
 ## License
 

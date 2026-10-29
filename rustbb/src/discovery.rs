@@ -1,1080 +1,121 @@
+//! Let Cargo identify targets and workspace roots; retain the original manifests.
+
 use anyhow::{Context, Result};
-use cargo_toml::{Dependency, DepsSet, Manifest};
-use regex::Regex;
-use std::collections::BTreeMap;
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::process::Command;
-use syn::{parse_file, Item};
 
 #[derive(Debug, Clone)]
 pub struct CrateInfo {
     pub name: String,
     pub path: PathBuf,
     pub main_path: PathBuf,
-    pub strategy: TransformStrategy,
-    pub dependencies: BTreeMap<String, DepInfo>,
-    /// If true, this crate has a library (lib.rs) that the binary may depend on
-    pub has_library: bool,
-    /// Version of the crate (for adding as dependency)
-    pub version: Option<String>,
-    /// If true, main.rs has internal `mod` declarations that require copying source files
-    pub has_internal_modules: bool,
-    /// Source directory path (usually src/)
-    pub src_dir: PathBuf,
-    /// Path dependencies that need to be included (workspace members)
-    /// Maps package name to PathDepInfo
-    pub path_dependencies: BTreeMap<String, PathDepInfo>,
-}
-
-/// Information about a path dependency
-#[derive(Debug, Clone)]
-pub struct PathDepInfo {
-    /// Absolute path to the dependency
-    pub path: PathBuf,
-    /// The alias used in the depending crate (may differ from package name)
-    pub alias: Option<String>,
-}
-
-#[derive(Debug, Clone)]
-pub struct DepInfo {
-    pub version: Option<String>,
-    pub features: Vec<String>,
-    #[allow(dead_code)]
-    pub optional: bool,
-}
-
-#[derive(Debug, Clone)]
-pub enum TransformStrategy {
-    /// Simple fn main() - can be extracted directly
-    SimpleMain,
-    /// Has #[...] attributes on main - needs special handling
-    AttributedMain { attrs: Vec<String> },
-    /// Uses build script generated code - needs to run build first
-    BuildScriptMain { attrs: Vec<String> },
-    /// Uses uucore::bin! macro (uutils coreutils pattern)
-    UucoreBinMacro { crate_name: String },
-    /// Has a library interface we can use
-    #[allow(dead_code)]
-    LibraryInterface { entry_fn: String },
-    /// Cannot be transformed automatically
-    Unsupported { reason: String },
-}
-
-/// Options for analyzing a crate
-#[derive(Debug, Clone, Default)]
-pub struct AnalyzeOptions {
-    /// Additional features to enable
-    pub enabled_features: Vec<String>,
-    /// Whether to disable default features
-    pub no_default_features: bool,
-    /// Workspace context for resolving path dependencies
-    pub workspace_context: Option<WorkspaceContext>,
-}
-
-/// Context for resolving workspace-level information
-#[derive(Debug, Clone)]
-pub struct WorkspaceContext {
-    /// Workspace dependencies from [workspace.dependencies]
-    pub workspace_deps: BTreeMap<String, WorkspaceDep>,
-}
-
-/// A dependency defined in [workspace.dependencies]
-#[derive(Debug, Clone)]
-pub struct WorkspaceDep {
-    pub version: Option<String>,
-    pub features: Vec<String>,
-    pub path: Option<String>,
-}
-
-/// Analyze a workspace and find the default binary member
-fn analyze_workspace(
-    workspace_path: &Path,
-    manifest: &Manifest,
-    options: &AnalyzeOptions,
-) -> Result<CrateInfo> {
-    let workspace = manifest.workspace.as_ref().unwrap();
-    let mut default_member_error: Option<anyhow::Error> = None;
-
-    // Parse workspace context for resolving path dependencies
-    let workspace_context = parse_workspace_context(workspace_path, manifest)?;
-
-    // Create options with workspace context
-    let options_with_ws = AnalyzeOptions {
-        enabled_features: options.enabled_features.clone(),
-        no_default_features: options.no_default_features,
-        workspace_context: Some(workspace_context.clone()),
-    };
-
-    // First, try default-members (these are what `cargo run` would use)
-    // If these fail, we should show their error rather than trying other members
-    if !workspace.default_members.is_empty() {
-        for member in &workspace.default_members {
-            let member_path = workspace_path.join(member);
-            if member_path.exists() {
-                // Try to analyze this member with workspace context
-                match analyze_crate_with_options(&member_path, &options_with_ws) {
-                    Ok(info) => return Ok(info),
-                    Err(e) => {
-                        // Store the error from the default member - we'll show it if
-                        // it's about path deps since that's the most useful info
-                        default_member_error = Some(e);
-                        continue;
-                    }
-                }
-            }
-        }
-    }
-
-    // If we tried default members and they all failed with path dependency errors,
-    // show that error - it's more informative than "no binary found"
-    if let Some(ref err) = default_member_error {
-        let err_str = err.to_string();
-        if err_str.contains("path dependencies") {
-            // Return the error from the default member
-            return Err(default_member_error.unwrap());
-        }
-    }
-
-    // If no default-members or they failed for other reasons, try to find any member with a binary
-    for member_pattern in &workspace.members {
-        // Handle glob patterns like "crates/*"
-        let member_paths = if member_pattern.contains('*') {
-            glob_workspace_members(workspace_path, member_pattern)
-        } else {
-            vec![workspace_path.join(member_pattern)]
-        };
-
-        for member_path in member_paths {
-            if member_path.exists() {
-                // Check if this member has a main.rs
-                if member_path.join("src/main.rs").exists() {
-                    match analyze_crate_with_options(&member_path, &options_with_ws) {
-                        Ok(info) => return Ok(info),
-                        Err(_) => continue,
-                    }
-                }
-            }
-        }
-    }
-
-    // If we had an error from the default member, prefer showing that
-    if let Some(err) = default_member_error {
-        return Err(err);
-    }
-
-    // Build a helpful error message listing the workspace members
-    let members_list = workspace.members.join(", ");
-    let default_members_info = if !workspace.default_members.is_empty() {
-        format!(
-            "\n  Default members: {}",
-            workspace.default_members.join(", ")
-        )
-    } else {
-        String::new()
-    };
-
-    anyhow::bail!(
-        "This is a Cargo workspace without a directly runnable binary.\n  \
-         Members: {}{}\n  \
-         Try specifying the binary member directly, e.g.:\n    \
-         rustbb build {}/helix-term",
-        members_list,
-        default_members_info,
-        workspace_path.display()
-    )
-}
-
-/// Expand glob patterns in workspace member paths
-fn glob_workspace_members(workspace_path: &Path, pattern: &str) -> Vec<PathBuf> {
-    let full_pattern = workspace_path.join(pattern);
-    let pattern_str = full_pattern.to_string_lossy();
-
-    glob::glob(&pattern_str)
-        .map(|paths| paths.filter_map(|p| p.ok()).collect())
-        .unwrap_or_default()
-}
-
-/// Parse workspace context from a workspace Cargo.toml
-fn parse_workspace_context(
-    _workspace_path: &Path,
-    manifest: &Manifest,
-) -> Result<WorkspaceContext> {
-    let workspace = manifest.workspace.as_ref().context("Not a workspace")?;
-
-    // Parse workspace.dependencies
-    let mut workspace_deps = BTreeMap::new();
-    for (name, dep) in &workspace.dependencies {
-        let ws_dep = match dep {
-            Dependency::Simple(version) => WorkspaceDep {
-                version: Some(version.clone()),
-                features: vec![],
-                path: None,
-            },
-            Dependency::Detailed(detail) => WorkspaceDep {
-                version: detail.version.clone(),
-                features: detail.features.clone(),
-                path: detail.path.clone(),
-            },
-            Dependency::Inherited(_) => {
-                // Shouldn't happen in workspace.dependencies
-                continue;
-            }
-        };
-        workspace_deps.insert(name.clone(), ws_dep);
-    }
-
-    Ok(WorkspaceContext { workspace_deps })
+    pub library_name: Option<String>,
+    pub manifest: toml::Value,
+    pub workspace_root: PathBuf,
+    pub workspace_manifest: toml::Value,
 }
 
 pub fn analyze_crate(path: &Path) -> Result<CrateInfo> {
-    analyze_crate_with_options(path, &AnalyzeOptions::default())
-}
-
-pub fn analyze_crate_with_options(path: &Path, options: &AnalyzeOptions) -> Result<CrateInfo> {
-    let cargo_toml_path = path.join("Cargo.toml");
-    let manifest = Manifest::from_path(&cargo_toml_path).context("Failed to parse Cargo.toml")?;
-
-    // Check if this is a workspace - if so, find the default binary member
-    if manifest.workspace.is_some() && manifest.package.is_none() {
-        return analyze_workspace(path, &manifest, options);
-    }
-
-    let name = manifest
-        .package
-        .as_ref()
-        .map(|p| p.name.clone())
-        .unwrap_or_else(|| "unknown".to_string());
-
-    // Find main.rs
-    let main_path = find_main_rs(path, &manifest)?;
-
-    // Analyze main() function
-    let source = fs::read_to_string(&main_path).context("Failed to read main.rs")?;
-    let strategy = analyze_main_function(&source)?;
-
-    // Compute effective features
-    let mut effective_features: Vec<String> = Vec::new();
-
-    // Add default features unless disabled
-    if !options.no_default_features {
-        if let Some(defaults) = manifest.features.get("default") {
-            effective_features.extend(defaults.iter().cloned());
-        }
-    }
-
-    // Add user-specified features
-    effective_features.extend(options.enabled_features.iter().cloned());
-
-    // Resolve feature dependencies (features can enable other features)
-    effective_features = resolve_features(&effective_features, &manifest.features);
-
-    // Collect regular dependencies (excluding path deps - we handle those separately)
-    let mut dependencies = collect_deps_from_set(
-        &manifest.dependencies,
-        true,
-        &effective_features,
-        options.workspace_context.as_ref(),
-    );
-
-    // Collect path dependencies and try to resolve them
-    let mut path_dependencies: BTreeMap<String, PathDepInfo> = BTreeMap::new();
-    let mut unresolved_path_deps: Vec<String> = Vec::new();
-
-    for (dep_name, dep) in &manifest.dependencies {
-        if let Dependency::Detailed(detail) = dep {
-            if let Some(rel_path) = &detail.path {
-                // Try to resolve this path dependency
-                let resolved_path = path.join(rel_path).canonicalize().ok();
-
-                if let Some(abs_path) = resolved_path {
-                    if abs_path.exists() {
-                        // Get the actual package name from the target's Cargo.toml
-                        let pkg_name = get_package_name_from_path(&abs_path)
-                            .or_else(|| detail.package.clone())
-                            .unwrap_or_else(|| dep_name.clone());
-
-                        // Determine if this is an alias (renamed dependency)
-                        let alias = if pkg_name != *dep_name {
-                            Some(dep_name.clone())
-                        } else {
-                            None
-                        };
-
-                        path_dependencies.insert(
-                            pkg_name,
-                            PathDepInfo {
-                                path: abs_path,
-                                alias,
-                            },
-                        );
-                        continue;
-                    }
-                }
-
-                // Couldn't resolve this path dependency
-                unresolved_path_deps.push(dep_name.clone());
-            }
-        }
-    }
-
-    // Also check for path deps in build-dependencies
-    for (dep_name, dep) in &manifest.build_dependencies {
-        if let Dependency::Detailed(detail) = dep {
-            if let Some(rel_path) = &detail.path {
-                if let Ok(abs_path) = path.join(rel_path).canonicalize() {
-                    if abs_path.exists() {
-                        let pkg_name = get_package_name_from_path(&abs_path)
-                            .or_else(|| detail.package.clone())
-                            .unwrap_or_else(|| dep_name.clone());
-
-                        let alias = if pkg_name != *dep_name {
-                            Some(dep_name.clone())
-                        } else {
-                            None
-                        };
-
-                        path_dependencies.insert(
-                            pkg_name,
-                            PathDepInfo {
-                                path: abs_path,
-                                alias,
-                            },
-                        );
-                    }
-                }
-            }
-        }
-    }
-
-    // Recursively collect transitive path dependencies
-    collect_transitive_path_deps(&mut path_dependencies);
-
-    // Only error if there are truly unresolved path dependencies
-    if !unresolved_path_deps.is_empty() {
-        anyhow::bail!(
-            "Crate '{}' has path dependencies that cannot be resolved:\n  {}\n\n\
-             Path dependencies are typically workspace members that aren't published to crates.io.\n\
-             This crate cannot be built standalone with rustbb.\n\n\
-             Options:\n\
-             - Build the crate directly with: cargo build --release\n\
-             - If this is a workspace, some members may be publishable individually",
-            name,
-            unresolved_path_deps.join(", ")
-        );
-    }
-
-    // Collect target-specific dependencies that apply to the current platform
-    for (target_cfg, target) in &manifest.target {
-        if cfg_matches_current_platform(target_cfg) {
-            let target_deps = collect_deps_from_set(
-                &target.dependencies,
-                true,
-                &effective_features,
-                options.workspace_context.as_ref(),
-            );
-            // Merge target deps into main deps
-            for (name, info) in target_deps {
-                dependencies.entry(name).or_insert(info);
-            }
-        }
-    }
-
-    // Check if this crate has a library component
-    let has_library = path.join("src/lib.rs").exists() || manifest.lib.is_some();
-
-    // Get version from manifest
-    let version = manifest
-        .package
-        .as_ref()
-        .and_then(|p| p.version.get().ok())
-        .map(|v| v.to_string());
-
-    // Check if main.rs has internal module declarations
-    let has_internal_modules = has_mod_declarations(&source);
-
-    // Determine the source directory
-    let src_dir = main_path.parent().unwrap_or(path).to_path_buf();
-
-    Ok(CrateInfo {
-        name,
-        path: path.to_path_buf(),
-        main_path,
-        strategy,
-        dependencies,
-        has_library,
-        version,
-        has_internal_modules,
-        src_dir,
-        path_dependencies,
-    })
-}
-
-/// Resolve feature dependencies - features can enable other features
-fn resolve_features(
-    enabled: &[String],
-    all_features: &std::collections::BTreeMap<String, Vec<String>>,
-) -> Vec<String> {
-    let mut resolved: std::collections::HashSet<String> = enabled.iter().cloned().collect();
-    let mut to_process: Vec<String> = enabled.to_vec();
-
-    while let Some(feature) = to_process.pop() {
-        if let Some(deps) = all_features.get(&feature) {
-            for dep in deps {
-                // Handle dep:crate_name syntax
-                let dep_name = dep.strip_prefix("dep:").unwrap_or(dep);
-
-                // Handle crate_name/feature syntax
-                let dep_name = dep_name.split('/').next().unwrap_or(dep_name);
-
-                if !resolved.contains(dep_name) {
-                    resolved.insert(dep_name.to_string());
-                    to_process.push(dep_name.to_string());
-                }
-            }
-        }
-    }
-
-    resolved.into_iter().collect()
-}
-
-/// Check if source code has external `mod name;` declarations.
-/// These indicate the crate has separate .rs files that need to be copied.
-///
-/// Uses syn AST parsing instead of regex to avoid false positives on
-/// `mod` in comments, strings, or doc attributes.
-fn has_mod_declarations(source: &str) -> bool {
-    let Ok(file) = parse_file(source) else {
-        return false;
-    };
-
-    file.items.iter().any(|item| {
-        // Item::Mod with content == None means `mod name;` (external file reference)
-        // Item::Mod with content == Some(...) means `mod name { ... }` (inline module)
-        matches!(item, Item::Mod(m) if m.content.is_none())
-    })
-}
-
-/// Evaluate if a cfg expression applies to the current platform
-/// Handles common patterns like cfg(unix), cfg(windows), cfg(target_os = "linux"), etc.
-fn cfg_matches_current_platform(cfg_str: &str) -> bool {
-    // Parse out the cfg expression
-    // Handle both `cfg(...)` and `'cfg(...)'` formats
-    let cfg_content = if let Some(inner) = cfg_str
-        .trim()
-        .strip_prefix("cfg(")
-        .and_then(|s| s.strip_suffix(')'))
-    {
-        inner
-    } else if let Some(inner) = cfg_str
-        .trim()
-        .strip_prefix("'cfg(")
-        .and_then(|s| s.strip_suffix(")'"))
-    {
-        inner
-    } else {
-        // Not a cfg expression we understand - include it to be safe
-        return true;
-    };
-
-    // Evaluate simple cfg expressions
-    eval_cfg_expr(cfg_content.trim())
-}
-
-/// Evaluate a cfg expression (the inner part, without cfg(...))
-fn eval_cfg_expr(expr: &str) -> bool {
-    let expr_lower = expr.to_lowercase();
-
-    // Handle `not(...)`
-    if let Some(inner) = expr.strip_prefix("not(").and_then(|s| s.strip_suffix(')')) {
-        return !eval_cfg_expr(inner.trim());
-    }
-
-    // Handle `all(...)`
-    if let Some(inner) = expr.strip_prefix("all(").and_then(|s| s.strip_suffix(')')) {
-        // Split by commas (simplified - doesn't handle nested parens well)
-        return split_cfg_args(inner)
-            .iter()
-            .all(|arg| eval_cfg_expr(arg.trim()));
-    }
-
-    // Handle `any(...)`
-    if let Some(inner) = expr.strip_prefix("any(").and_then(|s| s.strip_suffix(')')) {
-        return split_cfg_args(inner)
-            .iter()
-            .any(|arg| eval_cfg_expr(arg.trim()));
-    }
-
-    // Simple predicates
-    match expr_lower.as_str() {
-        "unix" => cfg!(unix),
-        "windows" => cfg!(windows),
-        "target_family = \"unix\"" => cfg!(unix),
-        "target_family = \"windows\"" => cfg!(windows),
-        _ => {
-            // Handle target_os = "..."
-            if expr_lower.contains("target_os") {
-                if expr_lower.contains("linux") {
-                    return cfg!(target_os = "linux");
-                }
-                if expr_lower.contains("macos") || expr_lower.contains("darwin") {
-                    return cfg!(target_os = "macos");
-                }
-                if expr_lower.contains("windows") {
-                    return cfg!(target_os = "windows");
-                }
-                if expr_lower.contains("freebsd") {
-                    return cfg!(target_os = "freebsd");
-                }
-            }
-
-            // Handle target_arch = "..."
-            if expr_lower.contains("target_arch") {
-                if expr_lower.contains("x86_64") {
-                    return cfg!(target_arch = "x86_64");
-                }
-                if expr_lower.contains("x86") && !expr_lower.contains("x86_64") {
-                    return cfg!(target_arch = "x86");
-                }
-                if expr_lower.contains("aarch64") {
-                    return cfg!(target_arch = "aarch64");
-                }
-                if expr_lower.contains("arm") {
-                    return cfg!(target_arch = "arm");
-                }
-            }
-
-            // Handle target_env = "..."
-            if expr_lower.contains("target_env") {
-                if expr_lower.contains("gnu") {
-                    return cfg!(target_env = "gnu");
-                }
-                if expr_lower.contains("msvc") {
-                    return cfg!(target_env = "msvc");
-                }
-                if expr_lower.contains("musl") {
-                    return cfg!(target_env = "musl");
-                }
-            }
-
-            // Unknown predicate - include it to be safe
-            true
-        }
-    }
-}
-
-/// Split cfg arguments by comma, respecting parentheses nesting
-fn split_cfg_args(s: &str) -> Vec<&str> {
-    let mut args = Vec::new();
-    let mut depth = 0;
-    let mut start = 0;
-
-    for (i, c) in s.char_indices() {
-        match c {
-            '(' => depth += 1,
-            ')' => depth -= 1,
-            ',' if depth == 0 => {
-                args.push(&s[start..i]);
-                start = i + 1;
-            }
-            _ => {}
-        }
-    }
-
-    if start < s.len() {
-        args.push(&s[start..]);
-    }
-
-    args
-}
-
-/// Collect dependencies from a DepsSet, filtering appropriately
-fn collect_deps_from_set(
-    deps: &DepsSet,
-    filter_optional: bool,
-    default_features: &[String],
-    workspace_context: Option<&WorkspaceContext>,
-) -> BTreeMap<String, DepInfo> {
-    deps.iter()
-        .filter_map(|(name, dep)| {
-            let (actual_name, info) = match dep {
-                Dependency::Simple(version) => (
-                    name.clone(),
-                    Some(DepInfo {
-                        version: Some(version.clone()),
-                        features: vec![],
-                        optional: false,
-                    }),
-                ),
-                Dependency::Detailed(detail) => {
-                    // Skip path-based dependencies (workspace members, local crates)
-                    // They are handled separately in path_dependencies
-                    if detail.path.is_some() {
-                        return None;
-                    }
-                    // Skip git dependencies for now (they need special handling)
-                    if detail.git.is_some() {
-                        return None;
-                    }
-                    // Handle optional dependencies
-                    if detail.optional && filter_optional {
-                        // Check if this optional dep is enabled by default features
-                        // Default features can reference deps directly or via dep:name syntax
-                        let dep_enabled = default_features.iter().any(|f| {
-                            f == name
-                                || f == &format!("dep:{}", name)
-                                || f.starts_with(&format!("{}/", name))
-                        });
-                        if !dep_enabled {
-                            return None;
-                        }
-                    }
-                    // Use the actual package name if it's different (renamed dependency)
-                    let actual_name = detail.package.clone().unwrap_or_else(|| name.clone());
-                    (
-                        actual_name,
-                        Some(DepInfo {
-                            version: detail.version.clone(),
-                            features: detail.features.clone(),
-                            optional: detail.optional,
-                        }),
-                    )
-                }
-                Dependency::Inherited(inherited) => {
-                    // Handle workspace-inherited dependencies
-                    if inherited.workspace {
-                        // Try to resolve from workspace context
-                        if let Some(ws_ctx) = workspace_context {
-                            if let Some(ws_dep) = ws_ctx.workspace_deps.get(name) {
-                                // Skip if it's a path dependency in the workspace
-                                if ws_dep.path.is_some() {
-                                    return None;
-                                }
-                                // Merge features from both workspace def and local override
-                                let mut features = ws_dep.features.clone();
-                                features.extend(inherited.features.iter().cloned());
-                                features.sort();
-                                features.dedup();
-
-                                return Some((
-                                    name.clone(),
-                                    DepInfo {
-                                        version: ws_dep.version.clone(),
-                                        features,
-                                        optional: inherited.optional,
-                                    },
-                                ));
-                            }
-                        }
-                        // Can't resolve workspace dependency without context
-                        return None;
-                    }
-                    // Handle optional dependencies
-                    if inherited.optional && filter_optional {
-                        let dep_enabled = default_features.iter().any(|f| {
-                            f == name
-                                || f == &format!("dep:{}", name)
-                                || f.starts_with(&format!("{}/", name))
-                        });
-                        if !dep_enabled {
-                            return None;
-                        }
-                    }
-                    (
-                        name.clone(),
-                        Some(DepInfo {
-                            version: None,
-                            features: inherited.features.clone(),
-                            optional: inherited.optional,
-                        }),
-                    )
-                }
-            };
-            info.map(|i| (actual_name, i))
-        })
-        .collect()
-}
-
-/// Get the package name from a crate's Cargo.toml
-fn get_package_name_from_path(crate_path: &Path) -> Option<String> {
-    let cargo_toml = crate_path.join("Cargo.toml");
-    if let Ok(manifest) = Manifest::from_path(&cargo_toml) {
-        return manifest.package.map(|p| p.name);
-    }
-    None
-}
-
-/// Recursively collect transitive path dependencies
-/// This ensures we include all path dependencies of path dependencies
-fn collect_transitive_path_deps(path_deps: &mut BTreeMap<String, PathDepInfo>) {
-    let mut to_process: Vec<PathBuf> = path_deps.values().map(|d| d.path.clone()).collect();
-    let mut processed: std::collections::HashSet<PathBuf> = to_process.iter().cloned().collect();
-
-    while let Some(dep_path) = to_process.pop() {
-        let cargo_toml = dep_path.join("Cargo.toml");
-        if let Ok(manifest) = Manifest::from_path(&cargo_toml) {
-            // Check regular dependencies
-            for (dep_name, dep) in &manifest.dependencies {
-                collect_path_dep_if_present(
-                    dep_name,
-                    dep,
-                    &dep_path,
-                    path_deps,
-                    &mut to_process,
-                    &mut processed,
-                );
-            }
-
-            // Check build dependencies
-            for (dep_name, dep) in &manifest.build_dependencies {
-                collect_path_dep_if_present(
-                    dep_name,
-                    dep,
-                    &dep_path,
-                    path_deps,
-                    &mut to_process,
-                    &mut processed,
-                );
-            }
-
-            // Check dev dependencies (might be needed for tests)
-            for (dep_name, dep) in &manifest.dev_dependencies {
-                collect_path_dep_if_present(
-                    dep_name,
-                    dep,
-                    &dep_path,
-                    path_deps,
-                    &mut to_process,
-                    &mut processed,
-                );
-            }
-        }
-    }
-}
-
-/// Helper to collect a path dependency if present
-fn collect_path_dep_if_present(
-    dep_name: &str,
-    dep: &Dependency,
-    base_path: &Path,
-    path_deps: &mut BTreeMap<String, PathDepInfo>,
-    to_process: &mut Vec<PathBuf>,
-    processed: &mut std::collections::HashSet<PathBuf>,
-) {
-    if let Dependency::Detailed(detail) = dep {
-        if let Some(rel_path) = &detail.path {
-            if let Ok(abs_path) = base_path.join(rel_path).canonicalize() {
-                if abs_path.exists() && !processed.contains(&abs_path) {
-                    processed.insert(abs_path.clone());
-
-                    let pkg_name = get_package_name_from_path(&abs_path)
-                        .or_else(|| detail.package.clone())
-                        .unwrap_or_else(|| dep_name.to_string());
-
-                    let alias = if pkg_name != *dep_name {
-                        Some(dep_name.to_string())
-                    } else {
-                        None
-                    };
-
-                    // Only add if we don't already have this package
-                    if let std::collections::btree_map::Entry::Vacant(e) = path_deps.entry(pkg_name)
-                    {
-                        e.insert(PathDepInfo {
-                            path: abs_path.clone(),
-                            alias,
-                        });
-                        to_process.push(abs_path);
-                    }
-                }
-            }
-        }
-    }
-}
-
-fn find_main_rs(crate_path: &Path, manifest: &Manifest) -> Result<PathBuf> {
-    // First check if there's a [[bin]] entry with an explicit path
-    for bin in &manifest.bin {
-        if let Some(path) = &bin.path {
-            let bin_path = crate_path.join(path);
-            if bin_path.exists() {
-                return Ok(bin_path);
-            }
-        }
-    }
-
-    // Default candidates
-    let candidates = [
-        crate_path.join("src/main.rs"),
-        crate_path.join("src/bin/main.rs"),
-    ];
-
-    for candidate in candidates {
-        if candidate.exists() {
-            return Ok(candidate);
-        }
-    }
-
-    // Build a helpful error message
-    let crate_name = manifest
-        .package
-        .as_ref()
-        .map(|p| p.name.as_str())
-        .unwrap_or("unknown");
-
-    let has_lib = crate_path.join("src/lib.rs").exists() || manifest.lib.is_some();
-    let description = manifest
-        .package
-        .as_ref()
-        .and_then(|p| p.description.as_ref())
-        .and_then(|d| d.get().ok())
-        .map(|s| s.as_str())
-        .unwrap_or("");
-
-    let mut error_msg = format!(
-        "Crate '{}' does not have a binary target (no main.rs found)",
-        crate_name
-    );
-
-    if has_lib {
-        error_msg
-            .push_str("\n  This appears to be a library-only crate (has lib.rs but no main.rs)");
-    }
-
-    if !description.is_empty() {
-        error_msg.push_str(&format!("\n  Description: {}", description));
-    }
-
-    // Check for common naming confusions
-    let suggestions = get_crate_suggestions(crate_name);
-    if !suggestions.is_empty() {
-        error_msg.push_str("\n  Did you mean one of these?");
-        for suggestion in suggestions {
-            error_msg.push_str(&format!("\n    - {}", suggestion));
-        }
-    }
-
-    // Check if there are bin entries that don't have paths
-    let bin_names: Vec<&str> = manifest
-        .bin
-        .iter()
-        .filter_map(|b| b.name.as_deref())
-        .collect();
-    if !bin_names.is_empty() {
-        error_msg.push_str(&format!(
-            "\n  Note: Cargo.toml declares binaries {:?} but source files are missing",
-            bin_names
-        ));
-    }
-
-    anyhow::bail!("{}", error_msg)
-}
-
-/// Get suggestions for commonly confused crate names
-fn get_crate_suggestions(crate_name: &str) -> Vec<&'static str> {
-    match crate_name {
-        "helix" => vec!["github:helix-editor/helix (Helix text editor - not on crates.io)"],
-        "helix-term" => {
-            vec!["github:helix-editor/helix (Helix text editor - helix-term is just a placeholder)"]
-        }
-        "vim" | "neovim" | "nvim" => {
-            vec!["github:neovim/neovim (Neovim is written in C, not Rust)"]
-        }
-        "code" | "vscode" => vec!["VSCode is written in TypeScript, not Rust"],
-        _ => vec![],
-    }
-}
-
-fn analyze_main_function(source: &str) -> Result<TransformStrategy> {
-    // Check for uucore::bin! macro pattern (uutils coreutils individual utilities)
-    // Pattern: uucore::bin!(crate_name);
-    if let Ok(uucore_pattern) = Regex::new(r"uucore::bin!\s*\(\s*([a-zA-Z_][a-zA-Z0-9_]*)\s*\)") {
-        if let Some(captures) = uucore_pattern.captures(source) {
-            if let Some(crate_match) = captures.get(1) {
-                return Ok(TransformStrategy::UucoreBinMacro {
-                    crate_name: crate_match.as_str().to_string(),
-                });
-            }
-        }
-    }
-
-    // Check for include! macro which indicates build script generated code
-    let uses_build_script = source.contains("include!(") && source.contains("OUT_DIR");
-
-    let file = parse_file(source).context("Failed to parse Rust source")?;
-
-    for item in &file.items {
-        if let Item::Fn(func) = item {
-            if func.sig.ident == "main" {
-                // Check for attributes (excluding doc comments)
-                let attrs: Vec<String> = func
-                    .attrs
-                    .iter()
-                    .filter(|a| !a.path().is_ident("doc"))
-                    .map(|a| {
-                        // Convert path segments to string
-                        a.path()
-                            .segments
-                            .iter()
-                            .map(|s| s.ident.to_string())
-                            .collect::<Vec<_>>()
-                            .join("::")
-                    })
-                    .collect();
-
-                if uses_build_script {
-                    return Ok(TransformStrategy::BuildScriptMain { attrs });
-                } else if attrs.is_empty() {
-                    return Ok(TransformStrategy::SimpleMain);
-                } else {
-                    return Ok(TransformStrategy::AttributedMain { attrs });
-                }
-            }
-        }
-    }
-
-    // No main found
-    Ok(TransformStrategy::Unsupported {
-        reason: "No main() function found".to_string(),
-    })
-}
-
-/// Run cargo build on a crate to generate build script outputs, then capture them
-pub fn run_build_script(crate_path: &Path, crate_name: &str) -> Result<BTreeMap<String, String>> {
-    println!("    Running build script for {}...", crate_name);
-
-    // Copy .cargo/config.toml if it exists in the current directory or parents
-    // This is needed for NixOS and other environments with custom linker settings
-    crate::util::copy_cargo_config(crate_path)?;
-
-    // Run cargo build to trigger the build script
+    let manifest_path = path
+        .join("Cargo.toml")
+        .canonicalize()
+        .context("Cannot locate Cargo.toml")?;
     let output = Command::new("cargo")
-        .args(["build", "--message-format=json"])
-        .current_dir(crate_path)
+        .args([
+            "metadata",
+            "--format-version=1",
+            "--no-deps",
+            "--manifest-path",
+        ])
+        .arg(&manifest_path)
         .output()
-        .context("Failed to run cargo build")?;
-
-    if !output.status.success() {
-        let stderr = String::from_utf8_lossy(&output.stderr);
-        anyhow::bail!("Build script failed: {}", stderr);
+        .context("Failed to run cargo metadata")?;
+    anyhow::ensure!(
+        output.status.success(),
+        "Cargo metadata failed: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let metadata: serde_json::Value = serde_json::from_slice(&output.stdout)?;
+    let packages = metadata["packages"]
+        .as_array()
+        .context("Missing Cargo packages")?;
+    let requested = read_manifest(&manifest_path)?;
+    let package = if requested.get("package").is_some() {
+        packages.iter().find(|p| {
+            p["manifest_path"]
+                .as_str()
+                .is_some_and(|m| Path::new(m) == manifest_path)
+        })
+    } else {
+        let defaults = metadata["workspace_default_members"]
+            .as_array()
+            .context("Missing workspace default members")?;
+        packages
+            .iter()
+            .find(|p| defaults.contains(&p["id"]) && binary_target(p).is_some())
+            .or_else(|| packages.iter().find(|p| binary_target(p).is_some()))
     }
-
-    // Parse the JSON output to find OUT_DIR for this specific crate
-    let stdout = String::from_utf8_lossy(&output.stdout);
-    let mut out_dir: Option<PathBuf> = None;
-
-    for line in stdout.lines() {
-        if let Ok(json) = serde_json::from_str::<serde_json::Value>(line) {
-            // Look for build-script-executed message for our crate
-            if json.get("reason").and_then(|r| r.as_str()) == Some("build-script-executed") {
-                // Check if this is for our crate by examining the package_id
-                let package_id = json
-                    .get("package_id")
-                    .and_then(|p| p.as_str())
-                    .unwrap_or("");
-                if package_id.contains(&format!("#{}@", crate_name))
-                    || package_id.contains(&format!("/{}/", crate_name))
-                    || package_id.ends_with(&format!("#{}", crate_name))
-                {
-                    if let Some(out) = json.get("out_dir").and_then(|d| d.as_str()) {
-                        out_dir = Some(PathBuf::from(out));
-                        break;
-                    }
-                }
-            }
-        }
-    }
-
-    // If we didn't find it by package_id, try to find it in the target directory
-    if out_dir.is_none() {
-        let build_dir = crate_path.join("target/debug/build");
-        if build_dir.exists() {
-            for entry in fs::read_dir(&build_dir)? {
-                let entry = entry?;
-                let name = entry.file_name().to_string_lossy().to_string();
-                if name.starts_with(&format!("{}-", crate_name)) {
-                    let candidate = entry.path().join("out");
-                    if candidate.exists() {
-                        out_dir = Some(candidate);
-                        break;
-                    }
-                }
-            }
-        }
-    }
-
-    let out_dir = out_dir.context("Could not find OUT_DIR from build output")?;
-
-    // Collect all .rs files from OUT_DIR
-    let mut outputs = BTreeMap::new();
-    if out_dir.exists() {
-        collect_rs_files(&out_dir, &out_dir, &mut outputs)?;
-    }
-
-    Ok(outputs)
+    .context("No binary package found; specify a workspace binary member")?;
+    let target = binary_target(package).context("This package has no binary target")?;
+    let main_path = PathBuf::from(
+        target["src_path"]
+            .as_str()
+            .context("Missing binary source path")?,
+    );
+    let package_manifest = PathBuf::from(
+        package["manifest_path"]
+            .as_str()
+            .context("Missing manifest path")?,
+    );
+    let path = package_manifest
+        .parent()
+        .context("Invalid manifest path")?
+        .to_path_buf();
+    let workspace_root = PathBuf::from(
+        metadata["workspace_root"]
+            .as_str()
+            .context("Missing workspace root")?,
+    );
+    let library_name = package["targets"]
+        .as_array()
+        .context("Missing targets")?
+        .iter()
+        .find(|t| {
+            t["kind"]
+                .as_array()
+                .is_some_and(|k| k.iter().any(|v| matches!(v.as_str(), Some("lib" | "rlib"))))
+        })
+        .and_then(|t| t["name"].as_str())
+        .map(str::to_owned);
+    Ok(CrateInfo {
+        name: package["name"]
+            .as_str()
+            .context("Missing package name")?
+            .to_owned(),
+        path,
+        main_path,
+        library_name,
+        manifest: read_manifest(&package_manifest)?,
+        workspace_manifest: read_manifest(&workspace_root.join("Cargo.toml"))?,
+        workspace_root,
+    })
 }
 
-/// Recursively collect .rs files from a directory
-fn collect_rs_files(base: &Path, dir: &Path, outputs: &mut BTreeMap<String, String>) -> Result<()> {
-    if !dir.is_dir() {
-        return Ok(());
-    }
-
-    for entry in fs::read_dir(dir)? {
-        let entry = entry?;
-        let path = entry.path();
-
-        if path.is_dir() {
-            collect_rs_files(base, &path, outputs)?;
-        } else if path.extension().is_some_and(|ext| ext == "rs") {
-            let relative = path
-                .strip_prefix(base)
-                .unwrap_or(&path)
-                .to_string_lossy()
-                .to_string();
-            let content = fs::read_to_string(&path)?;
-            outputs.insert(relative, content);
-        }
-    }
-
-    Ok(())
+fn binary_target(package: &serde_json::Value) -> Option<&serde_json::Value> {
+    let targets = package["targets"].as_array()?;
+    let default_run = package["default_run"].as_str();
+    targets.iter().find(|t| {
+        t["kind"]
+            .as_array()
+            .is_some_and(|k| k.iter().any(|v| v == "bin"))
+            && default_run.is_none_or(|name| t["name"] == name)
+    })
 }
 
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn test_analyze_simple_main() {
-        let source = r#"
-fn main() {
-    println!("Hello, world!");
-}
-"#;
-        let strategy = analyze_main_function(source).unwrap();
-        assert!(matches!(strategy, TransformStrategy::SimpleMain));
-    }
-
-    #[test]
-    fn test_analyze_attributed_main() {
-        let source = r#"
-#[tokio::main]
-async fn main() {
-    println!("Hello, async world!");
-}
-"#;
-        let strategy = analyze_main_function(source).unwrap();
-        assert!(matches!(strategy, TransformStrategy::AttributedMain { .. }));
-    }
-
-    #[test]
-    fn test_analyze_no_main() {
-        let source = r#"
-fn not_main() {
-    println!("Hello!");
-}
-"#;
-        let strategy = analyze_main_function(source).unwrap();
-        assert!(matches!(strategy, TransformStrategy::Unsupported { .. }));
-    }
+pub fn read_manifest(path: &Path) -> Result<toml::Value> {
+    toml::from_str(
+        &fs::read_to_string(path).with_context(|| format!("Cannot read {}", path.display()))?,
+    )
+    .with_context(|| format!("Cannot parse {}", path.display()))
 }

@@ -1,20 +1,18 @@
-//! Fetch crates from various sources (crates.io, git, local paths)
+//! Fetch sources into private, per-request directories. Never execute a cached checkout.
 
 use anyhow::{Context, Result};
+use std::fs;
 use std::path::{Path, PathBuf};
 use std::process::Command;
+use tempfile::TempDir;
 
-/// Represents the source of a crate
 #[derive(Debug, Clone)]
 pub enum CrateSource {
-    /// Local filesystem path
     Local(PathBuf),
-    /// Crate from crates.io (name, optional version)
     CratesIo {
         name: String,
         version: Option<String>,
     },
-    /// Git repository (url, optional branch/tag/rev)
     Git {
         url: String,
         reference: Option<String>,
@@ -22,146 +20,145 @@ pub enum CrateSource {
 }
 
 impl CrateSource {
-    /// Parse a crate source from a string
-    ///
-    /// Formats:
-    /// - `./path/to/crate` or `/absolute/path` - Local path
-    /// - `crate_name` or `crate_name@version` - crates.io
-    /// - `git:url` or `git:url#branch` - Git repository
-    /// - `github:user/repo` or `github:user/repo#branch` - GitHub shorthand
     pub fn parse(s: &str) -> Result<Self> {
-        // Check for git: prefix
         if let Some(rest) = s.strip_prefix("git:") {
             return Self::parse_git(rest);
         }
-
-        // Check for github: shorthand
-        if let Some(rest) = s.strip_prefix("github:") {
-            let url = format!("https://github.com/{}.git", rest.split('#').next().unwrap());
-            let reference = rest.split('#').nth(1).map(|s| s.to_string());
-            return Ok(CrateSource::Git { url, reference });
+        for (prefix, host) in [("github:", "github.com"), ("gitlab:", "gitlab.com")] {
+            if let Some(rest) = s.strip_prefix(prefix) {
+                let (repo, reference) = rest.split_once('#').unwrap_or((rest, ""));
+                let url = format!("https://{host}/{repo}.git");
+                return Self::parse_git(&format!("{url}#{reference}"));
+            }
         }
-
-        // Check for gitlab: shorthand
-        if let Some(rest) = s.strip_prefix("gitlab:") {
-            let url = format!("https://gitlab.com/{}.git", rest.split('#').next().unwrap());
-            let reference = rest.split('#').nth(1).map(|s| s.to_string());
-            return Ok(CrateSource::Git { url, reference });
+        if s.starts_with('.') || s.contains('/') || Path::new(s).exists() {
+            return Ok(Self::Local(PathBuf::from(s)));
         }
-
-        // Check if it looks like a path (contains / or . at start, or is absolute)
-        if s.starts_with('/')
-            || s.starts_with("./")
-            || s.starts_with("../")
-            || s.contains('/')
-            || Path::new(s).exists()
-        {
-            return Ok(CrateSource::Local(PathBuf::from(s)));
-        }
-
-        // Otherwise, treat as crates.io crate
-        Self::parse_crates_io(s)
-    }
-
-    fn parse_git(s: &str) -> Result<Self> {
-        let (url, reference) = if let Some(idx) = s.find('#') {
-            (&s[..idx], Some(s[idx + 1..].to_string()))
-        } else {
-            (s, None)
-        };
-
-        Ok(CrateSource::Git {
-            url: url.to_string(),
-            reference,
+        let (name, version) = s
+            .split_once('@')
+            .map_or((s, None), |(n, v)| (n, Some(v.to_owned())));
+        anyhow::ensure!(
+            !name.is_empty()
+                && name
+                    .bytes()
+                    .all(|b| b.is_ascii_alphanumeric() || b == b'-' || b == b'_'),
+            "Invalid crates.io package name: {name:?}"
+        );
+        anyhow::ensure!(version.as_deref() != Some(""), "Empty version requirement");
+        Ok(Self::CratesIo {
+            name: name.to_owned(),
+            version,
         })
     }
 
-    fn parse_crates_io(s: &str) -> Result<Self> {
-        if let Some(idx) = s.find('@') {
-            let name = s[..idx].to_string();
-            let version = Some(s[idx + 1..].to_string());
-            Ok(CrateSource::CratesIo { name, version })
-        } else {
-            Ok(CrateSource::CratesIo {
-                name: s.to_string(),
-                version: None,
-            })
-        }
+    fn parse_git(s: &str) -> Result<Self> {
+        let (url, reference) = s.split_once('#').unwrap_or((s, ""));
+        anyhow::ensure!(!url.is_empty() && !url.starts_with('-'), "Invalid Git URL");
+        anyhow::ensure!(!reference.starts_with('-'), "Invalid Git reference");
+        Ok(Self::Git {
+            url: url.to_owned(),
+            reference: (!reference.is_empty()).then(|| reference.to_owned()),
+        })
     }
 
-    /// Get a display name for this source
     pub fn display_name(&self) -> String {
         match self {
-            CrateSource::Local(path) => path.display().to_string(),
-            CrateSource::CratesIo { name, version } => {
-                if let Some(v) = version {
-                    format!("{}@{}", name, v)
-                } else {
-                    name.clone()
-                }
-            }
-            CrateSource::Git { url, reference } => {
-                if let Some(r) = reference {
-                    format!("{}#{}", url, r)
-                } else {
-                    url.clone()
-                }
-            }
+            Self::Local(path) => path.display().to_string(),
+            Self::CratesIo { name, version } => version
+                .as_ref()
+                .map_or_else(|| name.clone(), |v| format!("{name}@{v}")),
+            Self::Git { url, reference } => reference
+                .as_ref()
+                .map_or_else(|| url.clone(), |r| format!("{url}#{r}")),
         }
     }
 }
 
-/// Fetched crate ready for processing
-#[allow(dead_code)]
 pub struct FetchedCrate {
     pub name: String,
     pub path: PathBuf,
-    pub source: CrateSource,
-    /// If true, the path is temporary and should be cleaned up
-    pub is_temporary: bool,
+    // Keep a fresh Git checkout alive until the complete build finishes.
+    _temporary: Option<TempDir>,
 }
 
-/// Fetch a crate from its source to a local path
+pub fn default_cache_dir() -> Result<PathBuf> {
+    Ok(dirs::cache_dir()
+        .context("Cannot locate the user's cache directory; use --cache-dir")?
+        .join("rustbb"))
+}
+
+/// Refuse symlinks, foreign-owned directories, and writable shared ancestors.
+/// The root-owned sticky system temporary directory is a safe ancestor, not a cache root.
+pub fn prepare_cache_dir(path: &Path) -> Result<PathBuf> {
+    let path = std::path::absolute(path)?;
+    for ancestor in path.ancestors().collect::<Vec<_>>().into_iter().rev() {
+        if let Err(e) = fs::symlink_metadata(ancestor) {
+            if e.kind() != std::io::ErrorKind::NotFound {
+                return Err(e.into());
+            }
+            let mut builder = fs::DirBuilder::new();
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::DirBuilderExt;
+                builder.mode(0o700);
+            }
+            if let Err(e) = builder.create(ancestor) {
+                // Concurrent invocations may create the same cache root. Always
+                // validate what won the race, rather than trusting AlreadyExists.
+                if e.kind() != std::io::ErrorKind::AlreadyExists {
+                    return Err(e.into());
+                }
+            }
+        }
+        let meta = fs::symlink_metadata(ancestor)?;
+        anyhow::ensure!(
+            !meta.file_type().is_symlink() && meta.is_dir(),
+            "Unsafe cache directory: {}",
+            ancestor.display()
+        );
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::MetadataExt;
+            // SAFETY: geteuid has no preconditions or side effects.
+            let uid = unsafe { libc::geteuid() };
+            let sticky_root = meta.uid() == 0 && meta.mode() & 0o1000 != 0 && ancestor != path;
+            anyhow::ensure!(
+                (meta.uid() == uid || (meta.uid() == 0 && ancestor != path))
+                    && (meta.mode() & 0o022 == 0 || sticky_root),
+                "Cache directory must be privately owned and not group/world writable: {}",
+                ancestor.display()
+            );
+        }
+    }
+    Ok(path)
+}
+
 pub fn fetch_crate(source: &CrateSource, cache_dir: &Path) -> Result<FetchedCrate> {
     match source {
-        CrateSource::Local(path) => fetch_local(path, source),
+        CrateSource::Local(path) => fetched(
+            path.canonicalize()
+                .with_context(|| format!("Invalid crate path: {}", path.display()))?,
+            None,
+        ),
         CrateSource::CratesIo { name, version } => {
-            fetch_from_crates_io(name, version.as_deref(), cache_dir, source)
+            fetch_from_crates_io(name, version.as_deref(), cache_dir)
         }
-        CrateSource::Git { url, reference } => {
-            fetch_from_git(url, reference.as_deref(), cache_dir, source)
-        }
+        CrateSource::Git { url, reference } => fetch_from_git(url, reference.as_deref(), cache_dir),
     }
 }
 
-fn fetch_local(path: &Path, source: &CrateSource) -> Result<FetchedCrate> {
-    let abs_path = if path.is_absolute() {
-        path.to_path_buf()
-    } else {
-        std::env::current_dir()?.join(path)
-    };
-
-    if !abs_path.exists() {
-        anyhow::bail!("Path does not exist: {}", abs_path.display());
-    }
-
-    // Get crate name from Cargo.toml
-    let cargo_toml = abs_path.join("Cargo.toml");
-    let name = if cargo_toml.exists() {
-        let manifest = cargo_toml::Manifest::from_path(&cargo_toml)?;
-        manifest
-            .package
-            .map(|p| p.name)
-            .unwrap_or_else(|| path.file_name().unwrap().to_string_lossy().to_string())
-    } else {
-        path.file_name().unwrap().to_string_lossy().to_string()
-    };
-
+fn fetched(path: PathBuf, temporary: Option<TempDir>) -> Result<FetchedCrate> {
+    let manifest = cargo_toml::Manifest::from_path(path.join("Cargo.toml"))?;
+    let name = manifest.package.map(|p| p.name).unwrap_or_else(|| {
+        path.file_name()
+            .unwrap_or_default()
+            .to_string_lossy()
+            .into_owned()
+    });
     Ok(FetchedCrate {
         name,
-        path: abs_path,
-        source: source.clone(),
-        is_temporary: false,
+        path,
+        _temporary: temporary,
     })
 }
 
@@ -169,274 +166,382 @@ fn fetch_from_crates_io(
     name: &str,
     version: Option<&str>,
     cache_dir: &Path,
-    source: &CrateSource,
 ) -> Result<FetchedCrate> {
-    println!("  Fetching {} from crates.io...", name);
-
-    // Use cargo to download the crate
-    // First, create a temporary Cargo.toml to fetch the crate
-    let fetch_dir = cache_dir.join(format!("fetch-{}", name));
-    std::fs::create_dir_all(&fetch_dir)?;
-
-    let dep_spec = if let Some(v) = version {
-        format!("{} = \"{}\"", name, v)
-    } else {
-        format!("{} = \"*\"", name)
+    let cache_dir = prepare_cache_dir(cache_dir)?;
+    let resolver = TempDir::new_in(cache_dir)?;
+    let manifest = toml::toml! {
+        [package]
+        name = "rustbb-source-resolver"
+        version = "0.0.0"
+        edition = "2021"
+        [workspace]
+        [dependencies.rustbb_source]
+        package = name
+        version = (version.unwrap_or("*"))
     };
-
-    let cargo_toml = format!(
-        r#"[package]
-name = "fetch-{name}"
-version = "0.0.0"
-edition = "2021"
-
-[dependencies]
-{dep_spec}
-"#
-    );
-
-    std::fs::write(fetch_dir.join("Cargo.toml"), cargo_toml)?;
-    std::fs::create_dir_all(fetch_dir.join("src"))?;
-    std::fs::write(fetch_dir.join("src/lib.rs"), "")?;
-
-    // Run cargo fetch to download
+    fs::write(
+        resolver.path().join("Cargo.toml"),
+        toml::to_string(&manifest)?,
+    )?;
+    fs::create_dir(resolver.path().join("src"))?;
+    fs::write(resolver.path().join("src/lib.rs"), "")?;
     let output = Command::new("cargo")
-        .args(["fetch"])
-        .current_dir(&fetch_dir)
+        .args(["metadata", "--format-version=1"])
+        .current_dir(resolver.path())
         .output()
-        .context("Failed to run cargo fetch")?;
+        .context("Failed to run cargo metadata")?;
+    anyhow::ensure!(
+        output.status.success(),
+        "Failed to fetch {name}: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let metadata: serde_json::Value = serde_json::from_slice(&output.stdout)?;
+    if let Some(crate_path) = resolved_registry_path(&metadata, name)? {
+        return fetched(crate_path, None);
+    }
+    // Cargo deliberately omits binary-only dependencies from metadata's graph,
+    // but keeps their exact identity in Cargo.lock. Vendor that locked graph;
+    // never guess a registry cache path or substitute a similarly named crate.
+    let lock: toml::Value =
+        toml::from_str(&fs::read_to_string(resolver.path().join("Cargo.lock"))?)?;
+    let (version, checksum) = locked_registry_package(&lock, name)?;
+    let output = Command::new("cargo")
+        .args([
+            "vendor",
+            "--locked",
+            "--versioned-dirs",
+            "--respect-source-config",
+            "vendor",
+        ])
+        .current_dir(resolver.path())
+        .output()
+        .context("Failed to vendor binary-only package")?;
+    anyhow::ensure!(
+        output.status.success(),
+        "Failed to vendor {name}: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let crate_path = resolver
+        .path()
+        .join("vendor")
+        .join(format!("{name}-{version}"));
+    let checksums: serde_json::Value =
+        serde_json::from_slice(&fs::read(crate_path.join(".cargo-checksum.json"))?)?;
+    anyhow::ensure!(
+        checksums["package"].as_str() == Some(checksum.as_str()),
+        "Vendored package checksum differs from Cargo's selected package"
+    );
+    // This is our private, checksum-verified copy, not Cargo's source cache.
+    // Detach it from any enclosing workspace before asking Cargo to analyze it.
+    let manifest_path = crate_path.join("Cargo.toml");
+    let mut manifest: toml::Value = toml::from_str(&fs::read_to_string(&manifest_path)?)?;
+    if let Some(package) = manifest
+        .get_mut("package")
+        .and_then(toml::Value::as_table_mut)
+    {
+        package.remove("workspace");
+    }
+    manifest
+        .as_table_mut()
+        .context("Invalid vendored manifest")?
+        .entry("workspace")
+        .or_insert_with(|| toml::Value::Table(toml::map::Map::new()));
+    fs::write(manifest_path, toml::to_string(&manifest)?)?;
+    fetched(crate_path, Some(resolver))
+}
 
-    if !output.status.success() {
-        anyhow::bail!(
-            "Failed to fetch crate {}: {}",
-            name,
+/// Follow the resolver root's dependency edge, never scan registry directory names.
+fn resolved_registry_path(metadata: &serde_json::Value, name: &str) -> Result<Option<PathBuf>> {
+    let resolve = &metadata["resolve"];
+    let root = resolve["root"]
+        .as_str()
+        .context("Cargo metadata has no resolver root")?;
+    let node = resolve["nodes"]
+        .as_array()
+        .context("Cargo metadata has no nodes")?
+        .iter()
+        .find(|n| n["id"].as_str() == Some(root))
+        .context("Missing resolver root node")?;
+    let Some(dependency) = node["deps"]
+        .as_array()
+        .context("Missing root dependencies")?
+        .iter()
+        .find(|d| d["name"] == "rustbb_source")
+    else {
+        return Ok(None);
+    };
+    let package_id = dependency["pkg"]
+        .as_str()
+        .context("Missing resolved package ID")?;
+    let package = metadata["packages"]
+        .as_array()
+        .context("Missing Cargo packages")?
+        .iter()
+        .find(|p| p["id"].as_str() == Some(package_id))
+        .context("Missing resolved package")?;
+    anyhow::ensure!(
+        package["name"] == name,
+        "Resolved package name differs from requested package"
+    );
+    anyhow::ensure!(
+        package["source"]
+            .as_str()
+            .is_some_and(|s| s.starts_with("registry+")),
+        "Requested package is not from a registry"
+    );
+    let manifest = Path::new(
+        package["manifest_path"]
+            .as_str()
+            .context("Missing resolved manifest")?,
+    );
+    Ok(Some(
+        manifest
+            .parent()
+            .context("Invalid resolved manifest path")?
+            .to_path_buf(),
+    ))
+}
+
+fn locked_registry_package(lock: &toml::Value, name: &str) -> Result<(String, String)> {
+    let packages = lock["package"]
+        .as_array()
+        .context("Missing lockfile packages")?;
+    let root = packages
+        .iter()
+        .find(|p| p["name"].as_str() == Some("rustbb-source-resolver") && p.get("source").is_none())
+        .context("Missing resolver lockfile entry")?;
+    let id = root["dependencies"]
+        .as_array()
+        .context("Missing locked dependency")?
+        .iter()
+        .filter_map(toml::Value::as_str)
+        .find(|d| d.split_whitespace().next() == Some(name))
+        .context("Requested package missing from Cargo.lock")?;
+    let mut id = id.split_whitespace();
+    id.next();
+    let version = id.next();
+    let source = id.next().map(|s| s.trim_matches(['(', ')']));
+    let candidates: Vec<_> = packages
+        .iter()
+        .filter(|p| {
+            p["name"].as_str() == Some(name)
+                && p.get("source")
+                    .and_then(toml::Value::as_str)
+                    .is_some_and(|s| s.starts_with("registry+") && source.is_none_or(|v| s == v))
+                && version.is_none_or(|v| p["version"].as_str() == Some(v))
+        })
+        .collect();
+    anyhow::ensure!(
+        candidates.len() == 1,
+        "Ambiguous or non-registry locked package {name}"
+    );
+    let package = candidates[0];
+    Ok((
+        package["version"]
+            .as_str()
+            .context("Missing locked version")?
+            .to_owned(),
+        package["checksum"]
+            .as_str()
+            .context("Missing registry checksum")?
+            .to_owned(),
+    ))
+}
+
+fn fetch_from_git(url: &str, reference: Option<&str>, cache_dir: &Path) -> Result<FetchedCrate> {
+    let cache_dir = prepare_cache_dir(cache_dir)?;
+    let checkout = TempDir::new_in(cache_dir)?;
+    let path = checkout.path().join("repo");
+    // Never reuse a checkout or its Git config, even if it has the expected origin.
+    // A fresh clone also isolates different revisions requested in the same build.
+    let output = Command::new("git")
+        .args(["clone", "--no-local", "--no-checkout", "--", url])
+        .arg(&path)
+        .output()
+        .context("Failed to run git clone")?;
+    anyhow::ensure!(
+        output.status.success(),
+        "Failed to clone {url}: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let revision = if let Some(reference) = reference {
+        anyhow::ensure!(!reference.starts_with('-'), "Invalid Git reference");
+        let output = Command::new("git")
+            .args(["fetch", "--", "origin", reference])
+            .current_dir(&path)
+            .output()?;
+        anyhow::ensure!(
+            output.status.success(),
+            "Failed to fetch Git reference {reference}: {}",
             String::from_utf8_lossy(&output.stderr)
         );
-    }
-
-    // Find the downloaded crate in the cargo cache
-    let cargo_home = std::env::var("CARGO_HOME")
-        .map(PathBuf::from)
-        .unwrap_or_else(|_| dirs::home_dir().unwrap().join(".cargo"));
-
-    let registry_src = cargo_home.join("registry/src");
-
-    // Find the crate directory (it will be in a subdirectory named after the registry)
-    let crate_path = find_crate_in_registry(&registry_src, name, version)?;
-
-    // Copy to our cache directory for modification
-    let dest_dir = cache_dir.join(format!("crate-{}", name));
-    if dest_dir.exists() {
-        std::fs::remove_dir_all(&dest_dir)?;
-    }
-    copy_dir_all(&crate_path, &dest_dir)?;
-
-    // Clean up fetch directory
-    let _ = std::fs::remove_dir_all(&fetch_dir);
-
-    Ok(FetchedCrate {
-        name: name.to_string(),
-        path: dest_dir,
-        source: source.clone(),
-        is_temporary: true,
-    })
-}
-
-fn find_crate_in_registry(
-    registry_src: &Path,
-    name: &str,
-    version: Option<&str>,
-) -> Result<PathBuf> {
-    // Registry sources are in subdirectories like "index.crates.io-6f17d22bba15001f"
-    for entry in std::fs::read_dir(registry_src)? {
-        let entry = entry?;
-        let registry_dir = entry.path();
-        if !registry_dir.is_dir() {
-            continue;
-        }
-
-        // Look for crate directories matching the pattern: name-version
-        for crate_entry in std::fs::read_dir(&registry_dir)? {
-            let crate_entry = crate_entry?;
-            let crate_dir = crate_entry.path();
-            let dir_name = crate_dir.file_name().unwrap().to_string_lossy();
-
-            // Check if this directory matches our crate
-            if dir_name.starts_with(&format!("{}-", name)) {
-                // Extract version from directory name
-                let dir_version = &dir_name[name.len() + 1..];
-
-                // If a specific version was requested, check it matches
-                if let Some(v) = version {
-                    if dir_version == v {
-                        return Ok(crate_dir);
-                    }
-                } else {
-                    // No specific version, return the first match (could improve to get latest)
-                    return Ok(crate_dir);
-                }
-            }
-        }
-    }
-
-    anyhow::bail!("Could not find crate {} in registry cache", name)
-}
-
-fn fetch_from_git(
-    url: &str,
-    reference: Option<&str>,
-    cache_dir: &Path,
-    source: &CrateSource,
-) -> Result<FetchedCrate> {
-    println!("  Cloning {}...", url);
-
-    // Create a unique directory name from the URL
-    let url_hash = simple_hash(url);
-    let clone_dir = cache_dir.join(format!("git-{}", url_hash));
-
-    if clone_dir.exists() {
-        // Update existing clone
-        let mut cmd = Command::new("git");
-        cmd.args(["fetch", "--all"]).current_dir(&clone_dir);
-        cmd.output()?;
+        "FETCH_HEAD"
     } else {
-        // Fresh clone
-        let mut cmd = Command::new("git");
-        cmd.args(["clone", "--depth=1"]);
-
-        if let Some(r) = reference {
-            cmd.args(["--branch", r]);
-        }
-
-        cmd.arg(url).arg(&clone_dir);
-
-        let output = cmd.output().context("Failed to run git clone")?;
-
-        if !output.status.success() {
-            anyhow::bail!(
-                "Failed to clone {}: {}",
-                url,
-                String::from_utf8_lossy(&output.stderr)
-            );
-        }
-    }
-
-    // If reference specified and not already on it, checkout
-    if let Some(r) = reference {
-        let output = Command::new("git")
-            .args(["checkout", r])
-            .current_dir(&clone_dir)
-            .output()?;
-
-        if !output.status.success() {
-            anyhow::bail!("Failed to checkout {}", r);
-        }
-    }
-
-    // Get crate name from Cargo.toml
-    let cargo_toml = clone_dir.join("Cargo.toml");
-    let name = if cargo_toml.exists() {
-        let manifest = cargo_toml::Manifest::from_path(&cargo_toml)?;
-        manifest
-            .package
-            .map(|p| p.name)
-            .unwrap_or_else(|| extract_repo_name(url))
-    } else {
-        extract_repo_name(url)
+        "HEAD"
     };
-
-    Ok(FetchedCrate {
-        name,
-        path: clone_dir,
-        source: source.clone(),
-        is_temporary: true,
-    })
-}
-
-fn extract_repo_name(url: &str) -> String {
-    url.trim_end_matches(".git")
-        .rsplit('/')
-        .next()
-        .unwrap_or("unknown")
-        .to_string()
-}
-
-fn simple_hash(s: &str) -> String {
-    // Simple hash for creating unique directory names
-    let mut hash: u64 = 0;
-    for byte in s.bytes() {
-        hash = hash.wrapping_mul(31).wrapping_add(byte as u64);
-    }
-    format!("{:016x}", hash)
-}
-
-fn copy_dir_all(src: &Path, dst: &Path) -> Result<()> {
-    std::fs::create_dir_all(dst)?;
-    for entry in std::fs::read_dir(src)? {
-        let entry = entry?;
-        let ty = entry.file_type()?;
-        let src_path = entry.path();
-        let dst_path = dst.join(entry.file_name());
-
-        if ty.is_dir() {
-            copy_dir_all(&src_path, &dst_path)?;
-        } else {
-            std::fs::copy(&src_path, &dst_path)?;
-        }
-    }
-    Ok(())
+    let output = Command::new("git")
+        .args(["checkout", "--detach", revision, "--"])
+        .current_dir(&path)
+        .output()?;
+    anyhow::ensure!(
+        output.status.success(),
+        "Failed to checkout {revision}: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    fetched(path, Some(checkout))
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use serde_json::json;
 
     #[test]
-    fn test_parse_local_path() {
-        let source = CrateSource::parse("./examples/echo").unwrap();
-        assert!(matches!(source, CrateSource::Local(_)));
-    }
-
-    #[test]
-    fn test_parse_crates_io() {
-        let source = CrateSource::parse("clap").unwrap();
+    fn parse_sources() {
         assert!(matches!(
-            source,
-            CrateSource::CratesIo {
-                name,
-                version: None
-            } if name == "clap"
+            CrateSource::parse("./examples/echo").unwrap(),
+            CrateSource::Local(_)
         ));
-
-        let source = CrateSource::parse("clap@4.0").unwrap();
-        assert!(matches!(
-            source,
-            CrateSource::CratesIo {
-                name,
-                version: Some(v)
-            } if name == "clap" && v == "4.0"
-        ));
+        assert!(
+            matches!(CrateSource::parse("clap@4").unwrap(), CrateSource::CratesIo { name, version: Some(v) } if name == "clap" && v == "4")
+        );
+        assert!(
+            matches!(CrateSource::parse("github:user/repo#v1").unwrap(), CrateSource::Git { url, reference: Some(r) } if url == "https://github.com/user/repo.git" && r == "v1")
+        );
+        assert!(CrateSource::parse("git:https://example.test/repo#--orphan").is_err());
+        assert!(CrateSource::parse("bad\"name").is_err());
     }
 
     #[test]
-    fn test_parse_git() {
-        let source = CrateSource::parse("git:https://github.com/user/repo.git").unwrap();
-        assert!(
-            matches!(source, CrateSource::Git { url, reference: None } if url.contains("github"))
+    fn registry_selection_uses_resolved_identity_not_prefix_or_first_version() {
+        let package = |id: &str, name: &str, path: &str| json!({"id": id, "name": name, "source": "registry+https://example.test", "manifest_path": path});
+        let mut metadata = json!({
+            "resolve": {"root": "root", "nodes": [{"id": "root", "deps": [{"name": "rustbb_source", "pkg": "new"}]}]},
+            "packages": [package("other", "tool-extra", "/cache/tool-extra-9/Cargo.toml"), package("old", "tool", "/cache/tool-1/Cargo.toml"), package("new", "tool", "/cache/tool-2/Cargo.toml")]
+        });
+        assert_eq!(
+            resolved_registry_path(&metadata, "tool").unwrap().unwrap(),
+            Path::new("/cache/tool-2")
         );
-
-        let source = CrateSource::parse("git:https://github.com/user/repo.git#main").unwrap();
-        assert!(matches!(source, CrateSource::Git { url: _, reference: Some(r) } if r == "main"));
+        assert!(resolved_registry_path(&metadata, "tool-extra").is_err());
+        metadata["resolve"]["nodes"][0]["deps"] = json!([]);
+        assert!(resolved_registry_path(&metadata, "tool").unwrap().is_none());
     }
 
     #[test]
-    fn test_parse_github_shorthand() {
-        let source = CrateSource::parse("github:user/repo").unwrap();
-        assert!(
-            matches!(source, CrateSource::Git { url, reference: None } if url == "https://github.com/user/repo.git")
+    fn binary_only_lock_selection_preserves_version_source_and_checksum() {
+        let mut lock: toml::Value = toml::from_str(
+            r#"
+[[package]]
+name = "rustbb-source-resolver"
+version = "0.0.0"
+dependencies = ["tool 2.0.0 (registry+https://expected.test)"]
+[[package]]
+name = "tool"
+version = "1.0.0"
+source = "registry+https://expected.test"
+checksum = "old"
+[[package]]
+name = "tool"
+version = "2.0.0"
+source = "registry+https://expected.test"
+checksum = "selected"
+[[package]]
+name = "tool"
+version = "2.0.0"
+source = "registry+https://other.test"
+checksum = "wrong-registry"
+"#,
+        )
+        .unwrap();
+        assert_eq!(
+            locked_registry_package(&lock, "tool").unwrap(),
+            ("2.0.0".into(), "selected".into())
         );
+        assert!(locked_registry_package(&lock, "tool-extra").is_err());
+        lock["package"][2]["source"] = toml::Value::String("git+https://expected.test".into());
+        assert!(locked_registry_package(&lock, "tool").is_err());
+    }
 
-        let source = CrateSource::parse("github:user/repo#v1.0").unwrap();
-        assert!(matches!(source, CrateSource::Git { url: _, reference: Some(r) } if r == "v1.0"));
+    #[test]
+    fn git_requests_are_fresh_isolated_and_support_commit_ids() {
+        let temp = TempDir::new().unwrap();
+        let repo = temp.path().join("source");
+        fs::create_dir(&repo).unwrap();
+        let git = |args: &[&str]| {
+            let output = Command::new("git")
+                .args(["-c", "commit.gpgSign=false", "-c", "tag.gpgSign=false"])
+                .args(args)
+                .current_dir(&repo)
+                .output()
+                .unwrap();
+            assert!(
+                output.status.success(),
+                "{}",
+                String::from_utf8_lossy(&output.stderr)
+            );
+            String::from_utf8(output.stdout).unwrap().trim().to_owned()
+        };
+        git(&["init", "--quiet"]);
+        let write = |version: &str| {
+            fs::write(
+                repo.join("Cargo.toml"),
+                format!("[package]\nname='tool'\nversion='{version}'\nedition='2021'\n"),
+            )
+            .unwrap();
+            fs::create_dir_all(repo.join("src")).unwrap();
+            fs::write(repo.join("src/main.rs"), "fn main(){}").unwrap();
+            git(&["add", "."]);
+            git(&[
+                "-c",
+                "user.name=test",
+                "-c",
+                "user.email=test@example.invalid",
+                "commit",
+                "--quiet",
+                "-m",
+                version,
+            ]);
+        };
+        write("1.0.0");
+        let first = git(&["rev-parse", "HEAD"]);
+        git(&["tag", "v1"]);
+        write("2.0.0");
+        let cache = temp.path().join("cache");
+        let url = repo.to_str().unwrap();
+        let old = fetch_from_git(url, Some(&first), &cache).unwrap();
+        let tag = fetch_from_git(url, Some("v1"), &cache).unwrap();
+        let current = fetch_from_git(url, None, &cache).unwrap();
+        assert_ne!(old.path, current.path);
+        assert!(fs::read_to_string(old.path.join("Cargo.toml"))
+            .unwrap()
+            .contains("1.0.0"));
+        assert!(fs::read_to_string(tag.path.join("Cargo.toml"))
+            .unwrap()
+            .contains("1.0.0"));
+        assert!(fs::read_to_string(current.path.join("Cargo.toml"))
+            .unwrap()
+            .contains("2.0.0"));
+        assert!(fetch_from_git(url, Some("does-not-exist"), &cache).is_err());
+        let old_path = old.path.clone();
+        drop(old);
+        assert!(!old_path.exists());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn cache_rejects_symlinks_and_shared_permissions() {
+        use std::os::unix::fs::{symlink, PermissionsExt};
+        let temp = TempDir::new().unwrap();
+        let cache = temp.path().join("cache");
+        prepare_cache_dir(&cache).unwrap();
+        assert_eq!(
+            fs::metadata(&cache).unwrap().permissions().mode() & 0o777,
+            0o700
+        );
+        symlink(&cache, temp.path().join("link")).unwrap();
+        assert!(prepare_cache_dir(&temp.path().join("link")).is_err());
+        fs::set_permissions(&cache, fs::Permissions::from_mode(0o777)).unwrap();
+        assert!(prepare_cache_dir(&cache).is_err());
     }
 }
