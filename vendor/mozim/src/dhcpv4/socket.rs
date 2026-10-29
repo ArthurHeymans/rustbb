@@ -1,4 +1,5 @@
 // SPDX-License-Identifier: Apache-2.0
+// Modified by rustbb contributors for Tokio registration; see RBB_PATCHES.md.
 
 use std::{
     ffi::CString,
@@ -115,7 +116,10 @@ impl DhcpRawSocket {
 
         log::debug!("Raw socket created {}", fd.as_raw_fd());
         Ok(DhcpRawSocket {
-            fd: AsyncFd::new(fd)?,
+            // SAFETY: This private AsyncFd owns fd for its entire lifetime;
+            // the descriptor is never replaced or closed through a raw alias.
+            fd: unsafe { AsyncFd::register(fd) }
+                .map_err(std::io::Error::from)?,
         })
     }
 }

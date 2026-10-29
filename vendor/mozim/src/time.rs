@@ -1,4 +1,5 @@
 // SPDX-License-Identifier: Apache-2.0
+// Modified by rustbb contributors for Tokio registration; see RBB_PATCHES.md.
 
 use std::{os::fd::OwnedFd, time::Duration};
 
@@ -56,7 +57,11 @@ impl DhcpTimer {
                 remains.as_secs(),
                 remains.subsec_millis(),
             );
-            let _ = AsyncFd::new(OwnedFd::from(fd))?.readable().await?;
+            // SAFETY: AsyncFd owns this descriptor until it is dropped. It is
+            // never swapped through get_mut() or closed by another owner.
+            let timer = unsafe { AsyncFd::register(OwnedFd::from(fd)) }
+                .map_err(std::io::Error::from)?;
+            let _ = timer.readable().await?;
         }
         Ok(())
     }
