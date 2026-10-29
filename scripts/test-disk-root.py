@@ -20,11 +20,16 @@ def run(command, **kwargs):
     return QEMU.run(command, **kwargs)
 
 
-def build(arch):
+def build(arch, features=None):
     env = QEMU.build_environment(arch)
+    if features is None:
+        features = env.get("RBB_TEST_FEATURES", "")
     target = QEMU.ARCHITECTURES[arch]["target"]
     run(["cargo", "build", "-p", "rbb-mkimage"], env=env)
-    run(["cargo", "build", "--release", "-p", "rbb-cmds", "--bins", "--target", target], env=env)
+    command = ["cargo", "build", "--release", "-p", "rbb-cmds", "--bins", "--target", target]
+    if features:
+        command += ["--features", features]
+    run(command, env=env)
     directory = Path(env.get("CARGO_TARGET_DIR", ROOT / "target")).absolute()
     return directory / "debug/rbb-mkimage", directory / target / "release/rbb", directory / target / "release/rbb-guest-test", directory
 
@@ -50,7 +55,10 @@ def main():
         kernel = QEMU.prepare_arm64_kernel(kernel, results)
     root = results / "root"
     if root.exists():
-        shutil.rmtree(root)
+        try:
+            shutil.rmtree(root)
+        except OSError as error:
+            raise RuntimeError(f"cannot reset disposable root fixture: {root}") from error
     for path in ["bin", "sbin", "etc", "dev", "proc", "sys", "run", "tmp"]:
         (root / path).mkdir(parents=True, exist_ok=True)
     shutil.copy2(payload, root / "bin/guest-test")

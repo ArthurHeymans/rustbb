@@ -231,6 +231,110 @@ fn verify() -> io::Result<()> {
     Ok(())
 }
 
+fn richer_stage() -> io::Result<()> {
+    use std::os::unix::fs::{FileTypeExt, MetadataExt};
+    let manifest = rbb_manifest::Manifest::parse(&fs::read("/etc/rbb/commands.json")?)?;
+    for name in rbb_manifest::COREUTILS_EXTRA
+        .iter()
+        .chain(["brush", "minish"].iter())
+    {
+        check(
+            manifest.commands.iter().any(|n| n.as_str() == *name),
+            "optional command missing from target inventory",
+        )?;
+        if !["minish", "test", "["].contains(name) {
+            applet(name, &["--help"])?;
+        }
+    }
+    fs::write("/tmp/text", "beta\nalpha\nalpha\n")?;
+    check(
+        applet("head", &["-n", "1", "/tmp/text"])? == "beta\n",
+        "head lines",
+    )?;
+    check(
+        applet("tail", &["-n", "1", "/tmp/text"])? == "alpha\n",
+        "tail lines",
+    )?;
+    check(
+        applet("sort", &["-u", "/tmp/text"])? == "alpha\nbeta\n",
+        "sort unique",
+    )?;
+    fs::write("/tmp/hash", "abc")?;
+    check(
+        applet("sha256sum", &["/tmp/hash"])?
+            .starts_with("ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad"),
+        "sha256sum",
+    )?;
+    fs::create_dir("/tmp/tree")?;
+    fs::write("/tmp/tree/child", "copied")?;
+    applet("cp", &["-r", "/tmp/tree", "/tmp/copied"])?;
+    check(
+        fs::read_to_string("/tmp/copied/child")? == "copied",
+        "recursive copy",
+    )?;
+    applet("rm", &["-r", "/tmp/copied"])?;
+    applet("mkfifo", &["/tmp/fifo"])?;
+    check(fs::metadata("/tmp/fifo")?.file_type().is_fifo(), "mkfifo")?;
+    applet("mknod", &["/tmp/null", "c", "1", "3"])?;
+    check(
+        fs::metadata("/tmp/null")?.rdev() == libc::makedev(1, 3),
+        "mknod character device",
+    )?;
+    applet(
+        "dd",
+        &[
+            "if=/tmp/text",
+            "of=/tmp/dd",
+            "bs=1",
+            "count=4",
+            "status=none",
+        ],
+    )?;
+    check(fs::read("/tmp/dd")? == b"beta", "dd bounded copy")?;
+    let timeout = Command::new("/bin/timeout")
+        .args(["0.05", "/bin/sleep", "2"])
+        .status()?;
+    check(timeout.code() == Some(124), "timeout exit code")?;
+    let script = "set -eu; cd /tmp; f() { printf '%s\\n' \"$1\"; }; x=$(f beta); for v in \"$x\" alpha alpha; do printf '%s\\n' \"$v\"; done | sort -u > result; test $(wc -l < result) -eq 2; export PROOF=works; test $(printenv PROOF) = works; a=(one two); test ${#a[@]} -eq 2; printf 'BRUSH_GUEST_PASS\\n'";
+    check(
+        applet(
+            "brush",
+            &["--no-config", "--noprofile", "--norc", "-c", script],
+        )? == "BRUSH_GUEST_PASS\n",
+        "brush functions, pipelines, loops, arrays, expansion or redirection",
+    )?;
+    check(
+        applet(
+            "sh",
+            &[
+                "--no-config",
+                "-c",
+                "[ -f /tmp/text ] && test x = x && printf 'POSIX_GUEST_PASS\\n'",
+            ],
+        )? == "POSIX_GUEST_PASS\n",
+        "sh external POSIX utilities",
+    )?;
+    let child = Command::new("/bin/sh")
+        .args(["-c", "printf '%s' $$"])
+        .stdout(std::process::Stdio::piped())
+        .spawn()?;
+    let pid = child.id();
+    let output = child.wait_with_output()?;
+    check(
+        output.status.success()
+            && String::from_utf8_lossy(&output.stdout).parse::<u32>() == Ok(pid),
+        "exec-self changed shell PID",
+    )?;
+    check(
+        applet("minish", &["-c", "echo fallback"])? == "fallback\n",
+        "minimal shell fallback",
+    )?;
+    println!("RBB_RICH_USERLAND_PASS arch={}", std::env::consts::ARCH);
+    io::stdout().flush()?;
+    applet("ctl", &["poweroff"])?;
+    Ok(())
+}
+
 fn image_stage(role: &str) -> io::Result<()> {
     use std::os::unix::fs::MetadataExt;
     let command = rbb_boot::cmdline::Cmdline::parse(&fs::read_to_string("/proc/cmdline")?)?;
@@ -302,6 +406,7 @@ fn image_stage(role: &str) -> io::Result<()> {
 
 fn run(role: &str) -> io::Result<i32> {
     match role {
+        "richer-stage" => richer_stage()?,
         "image-uinit" | "image-check" => image_stage(role)?,
         "setup" => {
             check(

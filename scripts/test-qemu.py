@@ -5,6 +5,7 @@ import gzip
 import hashlib
 import os
 from pathlib import Path
+import re
 import selectors
 import shutil
 import subprocess
@@ -93,7 +94,7 @@ def prepare_arm64_kernel(kernel, results):
     return output
 
 
-def test_console(args, kernel, image, logfile):
+def test_console(args, kernel, image, logfile, prompt=None):
     command = qemu_command(args, kernel, image)
     print("+", " ".join(command), flush=True)
     log = bytearray()
@@ -111,7 +112,8 @@ def test_console(args, kernel, image, logfile):
                     if not chunk:
                         break
                     log.extend(chunk)
-                    if sent < len(commands) and log.count(b"rbb# ") > sent:
+                    prompts = log.count(prompt) if prompt is not None else len(re.findall(rb"(?:^|[\r\n])[^\r\n]*[#$] ", log))
+                    if sent < len(commands) and prompts > sent:
                         process.stdin.write(commands[sent])
                         process.stdin.flush()
                         sent += 1
@@ -188,7 +190,10 @@ def main():
         parser.error("qemu-system-x86_64 not found")
     env = build_environment(args.arch)
     run(["cargo", "build", "-p", "rbb-mkimage"], env=env)
-    run(["cargo", "build", "--release", "-p", "rbb-cmds", "--bins", "--target", target], env=env)
+    command = ["cargo", "build", "--release", "-p", "rbb-cmds", "--bins", "--target", target]
+    if env.get("RBB_TEST_FEATURES"):
+        command += ["--features", env["RBB_TEST_FEATURES"]]
+    run(command, env=env)
     target_dir = Path(env.get("CARGO_TARGET_DIR", ROOT / "target"))
     if not target_dir.is_absolute():
         target_dir = ROOT / target_dir
@@ -237,10 +242,12 @@ def main():
         assert "rbb-init: shutdown complete" in log, "shutdown did not complete"
         assert "Kernel panic" not in log
         print(f"QEMU {action} PASS; log: {results / f'{action}.log'}", flush=True)
-    # Exercise the actual default user-facing image, including --build and its
-    # default config, rather than only the purpose-built verification payload.
+    # Exercise --build and the generated console for the chosen feature profile.
+    # The dedicated richer-userland suite also tests the default rich preset.
     image = results / "rescue.cpio.gz"
-    run([mkimage, "--build", "--workspace", ROOT, "--target", target, "-o", image], env=env)
+    command = [mkimage, "--build", "--workspace", ROOT, "--target", target, "-o", image]
+    command += ["--build-features", env["RBB_TEST_FEATURES"]] if env.get("RBB_TEST_FEATURES") else ["--preset", "minimal"]
+    run(command, env=env)
     test_console(args, kernel, image, results / "console.log")
     print(f"RBB_QEMU_END_TO_END_PASS arch={args.arch}", flush=True)
 

@@ -86,6 +86,19 @@ console over serial, including status and clean poweroff. The harness also invok
 `--build --preset minimal` and records actual small/rich executable and image
 sizes under `target/rescue-tools-tests/ARCH/sizes.json`.
 
+The baseline rescue, disk-root, local-kexec, netboot and image-builder suites
+also accept `RBB_TEST_FEATURES=rescue-tools` to repeat their cases using the rich
+binary. For example:
+
+```sh
+RBB_TEST_FEATURES=rescue-tools python3 scripts/test-netboot.py --arch arm64
+```
+
+The completed matrix passed 70 cases across both architectures (including the
+new suites), then 66 repeated boot/image cases with rich binaries: 136 VM cases
+in total. Logs remain under each suite's `target/` directory; reruns overwrite
+that suite's previous logs.
+
 All optional dependency notices/source pointers are generated using locked Cargo
 metadata with `--all-features`. Dependencies keep their own licenses; the source
 of our adapters is not relicensed by them.
