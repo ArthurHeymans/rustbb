@@ -1,0 +1,22 @@
+[package]
+name = "rbb-boot"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "Linux early-boot device discovery, root handoff and boot loading"
+
+[dependencies]
+libc = "0.2"
+nix = { version = "0.31", features = ["mount", "fs", "process", "reboot"] }
+serde = { version = "1", features = ["derive"] }
+ext4-view = { version = "1", features = ["std"] }
+fatfs = { version = "0.3", default-features = false, features = ["std", "alloc"] }
+gptman = "3"
+mbrman = "0.6"
+glob = "0.3"
+flate2 = "1"
+lzma-rust2 = { version = "0.24", default-features = false, features = ["std", "xz"] }
+
+[dev-dependencies]
+tempfile = "3"
+toml = "0.8"

@@ -1,11 +1,12 @@
 # Rust initramfs toolkit
 
-This workspace now has three companion crates for `rustbb`:
+This workspace has four companion crates for `rustbb`:
 
 - **rbb-init**: Linux PID 1 and foreground service supervisor; also usable as an
   unprivileged host supervisor (`--supervise`).
 - **rbb-cmds**: a statically linkable multicall rescue userland, binary `rbb`.
 - **rbb-mkimage**: deterministic `newc` CPIO image builder, optionally gzip-compressed.
+- **rbb-boot**: device/module discovery and [guarded disk-root handoff](disk-boot.md).
 
 This is a working **MVP**, not s6 compatibility or full u-root parity. The generic
 `rustbb` AST-based multicall builder remains independent; these boot-critical
@@ -205,8 +206,10 @@ Linux 6.18.58-0-virt. The arm64 kernel came from
 and had SHA-256
 `d1876369b061ef3bc33314f490240efcd32b031393cb34c6f81134fa862fe472`.
 That URL is updated by Alpine; retain/check the hash when reproducing these
-exact results. These tests cover initramfs boot and supervision, **not disk-root
-handoff, kexec, netboot or physical arm64 boards**, which are future work.
+exact results. This suite covers initramfs boot and supervision. The separate
+[disk-root tests](disk-boot.md) cover root handoff with dedicated kernels on both
+architectures. Kexec/netboot are subsequent increments; physical arm64 boards
+have not been tested.
 
 ## Alternatives and next steps
 
@@ -227,6 +230,6 @@ and directly testable; no code was copied from those projects.
 
 Still needed for s6/u-root-level coverage: readiness fd protocol, finish hooks,
 per-service logging/rotation, privilege dropping, resource limits, configuration
-reload, service directories/s6 wire compatibility, real-root handoff, module
-dependency resolution, DHCP/netlink tools, kexec, archive merging, and broader
+reload, service directories/s6 wire compatibility, automatic module discovery,
+DHCP/netlink tools, kexec, archive merging, and broader
 architectural/hardware testing. It is not ready to replace a production init.

@@ -216,6 +216,10 @@ pub fn base_image(binary: Vec<u8>) -> io::Result<Image> {
         )?;
     }
     image.insert("bbin/rbb", Entry::file(binary, 0o755))?;
+    image.insert(
+        "etc/rbb/initramfs-release",
+        Entry::file(b"rbb-initramfs v1\n".to_vec(), 0o644),
+    )?;
     for applet in rbb_cmds::APPLETS {
         image.insert(&format!("bbin/{applet}"), Entry::link("rbb"))?;
         image.insert(

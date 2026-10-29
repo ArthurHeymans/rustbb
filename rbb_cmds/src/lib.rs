@@ -10,7 +10,7 @@ use std::time::Duration;
 pub const APPLETS: &[&str] = &[
     "init", "ctl", "sh", "echo", "cat", "ls", "mkdir", "cp", "mv", "rm", "ln", "readlink", "chmod",
     "pwd", "sleep", "true", "false", "uname", "mount", "umount", "insmod", "dmesg", "ps", "free",
-    "kill", "poweroff", "reboot",
+    "kill", "poweroff", "reboot", "modprobe", "lsmod", "rmmod", "blkid",
 ];
 
 fn invalid(message: &str) -> io::Error {
@@ -270,22 +270,54 @@ pub fn run(name: &str, args: &[String]) -> io::Result<i32> {
             syscall(unsafe { libc::umount2(cstring(&args[0])?.as_ptr(), 0) })?;
         }
         "insmod" => {
-            use std::os::fd::AsRawFd;
             let module = args
                 .first()
-                .ok_or_else(|| invalid("insmod MODULE.ko [PARAMETERS...]"))?;
-            let file = fs::File::open(module)?;
-            let parameters = cstring(&args[1..].join(" "))?;
-            let result = unsafe {
-                libc::syscall(
-                    libc::SYS_finit_module,
-                    file.as_raw_fd(),
-                    parameters.as_ptr(),
-                    0,
-                )
-            };
-            if result == -1 {
+                .ok_or_else(|| invalid("insmod MODULE.ko[.gz|.xz] [PARAMETERS...]"))?;
+            rbb_boot::modules::insert(Path::new(module), &args[1..].join(" "))?;
+        }
+        "modprobe" => {
+            let module = args
+                .first()
+                .ok_or_else(|| invalid("modprobe MODULE [PARAMETERS...]"))?;
+            rbb_boot::modules::load(module, &args[1..].join(" "))?;
+        }
+        "lsmod" => {
+            exact(args, 0, "lsmod")?;
+            print!("{}", fs::read_to_string("/proc/modules")?);
+        }
+        "rmmod" => {
+            exact(args, 1, "rmmod MODULE")?;
+            let module = cstring(&args[0].replace('-', "_"))?;
+            if unsafe { libc::syscall(libc::SYS_delete_module, module.as_ptr(), libc::O_NONBLOCK) }
+                == -1
+            {
                 return Err(io::Error::last_os_error());
+            }
+        }
+        "blkid" => {
+            let devices = if args.is_empty() {
+                rbb_boot::device::discover()?
+            } else {
+                args.iter()
+                    .map(|p| rbb_boot::device::probe(Path::new(p)))
+                    .collect::<io::Result<Vec<_>>>()?
+            };
+            for device in devices {
+                if device.fstype.is_none() && device.partuuid.is_none() {
+                    continue;
+                }
+                print!("{}:", device.path.display());
+                for (key, value) in [
+                    ("TYPE", device.fstype),
+                    ("UUID", device.uuid),
+                    ("LABEL", device.label),
+                    ("PARTUUID", device.partuuid),
+                ] {
+                    if let Some(value) = value {
+                        print!(" {key}={value:?}");
+                    }
+                }
+                println!();
             }
         }
         "dmesg" => {

@@ -57,6 +57,10 @@ pub struct Config {
     pub shutdown_timeout_ms: u64,
     #[serde(default)]
     pub services: Vec<Service>,
+    /// Optional real disk root; kernel root= parameters can override this.
+    pub root: Option<rbb_boot::RootConfig>,
+    #[serde(default)]
+    pub modules: Vec<String>,
 }
 
 impl Service {
@@ -84,6 +88,18 @@ impl Config {
         if !self.control.starts_with('/') || self.control.len() > 100 {
             return Err(invalid(
                 "control socket must be an absolute path <= 100 bytes".into(),
+            ));
+        }
+        if let Some(root) = &self.root {
+            root.validate()?;
+        }
+        if self
+            .modules
+            .iter()
+            .any(|m| m.is_empty() || m.contains(['\0', ' ', '/']))
+        {
+            return Err(invalid(
+                "modules must be names or modaliases, not paths/parameters".into(),
             ));
         }
         let mut names = BTreeSet::new();

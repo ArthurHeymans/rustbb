@@ -7,6 +7,7 @@ description = "Small PID 1 and foreground service supervisor for Rust initramfs 
 
 [dependencies]
 libc = "0.2"
+rbb-boot = { path = "../rbb_boot" }
 serde = { version = "1", features = ["derive"] }
 toml = "0.8"
 

@@ -1,8 +1,9 @@
-# Proposed u-root-style boot feature set — approval required
+# u-root-style boot implementation roadmap
 
-**Status:** proposal, not implemented or approved. The current implementation
-boots its own rescue initramfs and supervises services on x86_64 and arm64.
-Disk-root handoff, disk kernel boot, and network kernel boot are not present yet.
+**Status:** A–E approved, including the MPL-2.0 BLS parser. Implementation is
+incremental; optional extensions below remain separate. Rescue initramfs and
+[guarded disk-root handoff](disk-boot.md) are now tested on x86_64 and arm64.
+Local-kernel and network-kernel handoff are the next increments.
 
 ## What was inspected
 
@@ -210,7 +211,7 @@ netboot services or the host's disks. Use stage-specific kernel command lines
 and markers so reaching the original rescue shell cannot falsely pass a second-
 stage boot test. Keep serial/QEMU logs, kernel/config hashes and artifact sizes.
 
-**Approval requested:** A–E as the main implementation scope; whether MPL-2.0
-BLS parsing is acceptable; whether classic kexec is required in addition to
-`kexec_file_load`; and which optional extensions, especially CrabEFI, belong in
-this delivery. No disk/netboot implementation should start before that choice.
+**Approval recorded:** A–E and the MPL-2.0 BLS parser are accepted. Use the local
+u-root loader as a reference when more capable kexec is needed. Classic kexec
+can follow the file-based path where needed; optional platform/payload features
+such as CrabEFI are not automatically implied by this approval.

@@ -124,6 +124,40 @@ pub fn run(args: &[String]) -> io::Result<()> {
     }
     if pid1 && !standalone {
         boot_filesystems()?;
+        let boot = (|| {
+            let cmdline = rbb_boot::cmdline::Cmdline::parse(&fs::read_to_string("/proc/cmdline")?)?;
+            for module in config.modules.iter().map(String::as_str).chain(
+                cmdline
+                    .get("rbb.modules")
+                    .unwrap_or("")
+                    .split(',')
+                    .filter(|m| !m.is_empty()),
+            ) {
+                rbb_boot::modules::load(module, "")?;
+            }
+            if let Some(root) = rbb_boot::RootConfig::from_cmdline(&cmdline, config.root.clone())? {
+                if let Some(delay) = cmdline.get("rootdelay") {
+                    let seconds: u64 = delay.parse().map_err(io::Error::other)?;
+                    if seconds > 300 {
+                        return Err(io::Error::other("rootdelay exceeds 300 seconds"));
+                    }
+                    std::thread::sleep(std::time::Duration::from_secs(seconds));
+                }
+                return rbb_boot::root::PreparedRoot::prepare(&root).map(Some);
+            }
+            Ok(None)
+        })();
+        match boot {
+            // After this point a mount-move failure is fatal, not recoverable
+            // by starting services against a potentially half-switched root.
+            Ok(Some(root)) => return root.exec(),
+            Ok(None) => {}
+            Err(error) => {
+                eprintln!("rbb-init: boot preparation failed: {error}; entering configured rescue services");
+                fs::create_dir_all("/run/rbb")?;
+                fs::write("/run/rbb/boot-error", error.to_string())?;
+            }
+        }
     }
     supervise(config, pid1 && !standalone)
 }

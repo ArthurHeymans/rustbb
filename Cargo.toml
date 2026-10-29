@@ -4,6 +4,7 @@ members = [
     "rustbb",
     "rustbb_runtime",
     "rbb_init",
+    "rbb_boot",
     "rbb_cmds",
     "rbb_mkimage",
     "examples/simple_echo",
