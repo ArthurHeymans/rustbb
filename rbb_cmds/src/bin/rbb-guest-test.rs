@@ -285,6 +285,57 @@ fn run(role: &str) -> io::Result<i32> {
         "should-not-run" => {
             fs::write("/run/should-not-run", "bad")?;
         }
+        "kernel-stage" => {
+            check(
+                unsafe { libc::getppid() } == 1,
+                "second-stage service is not supervised by PID 1",
+            )?;
+            let command = rbb_boot::cmdline::Cmdline::parse(&fs::read_to_string("/proc/cmdline")?)?;
+            check(
+                command.get("rbb.stage") == Some("second"),
+                "did not reach second kernel command line",
+            )?;
+            if let Some(previous) = command.get("rbb.previous_boot_id") {
+                check(
+                    fs::read_to_string("/proc/sys/kernel/random/boot_id")?.trim() != previous,
+                    "kernel boot ID did not change",
+                )?;
+            }
+            println!(
+                "RBB_KEXEC_SECOND_KERNEL_PASS arch={}",
+                std::env::consts::ARCH
+            );
+            io::stdout().flush()?;
+            applet("ctl", &["poweroff"])?;
+        }
+        "controlled-kexec" => {
+            wait(
+                || count("/run/stubborn-pid") > 0,
+                "stubborn service signal handler",
+            )?;
+            let append = format!(
+                "rbb.previous_boot_id={}",
+                fs::read_to_string("/proc/sys/kernel/random/boot_id")?.trim()
+            );
+            applet(
+                "boot",
+                &[
+                    "--source",
+                    "/etc/rbb/boot.toml",
+                    "--no-exec",
+                    "--require-hashes",
+                    "--append",
+                    &append,
+                ],
+            )?;
+            check(
+                rbb_boot::loader::kexec_loaded(),
+                "load-only did not load a kernel",
+            )?;
+            println!("RBB_CONTROLLED_KEXEC_REQUEST");
+            io::stdout().flush()?;
+            applet("kexec", &["-e"])?;
+        }
         "disk-init" => {
             check(
                 unsafe { libc::getpid() } == 1,
@@ -350,6 +401,12 @@ fn run(role: &str) -> io::Result<i32> {
                 !fs::read_to_string("/run/rbb/boot-error")?.is_empty(),
                 "boot failure was not recorded",
             )?;
+            if fs::read_to_string("/proc/cmdline")?.contains("rbb.test.no_kexec") {
+                check(
+                    !rbb_boot::loader::kexec_loaded(),
+                    "failed verification loaded a kernel",
+                )?;
+            }
             println!("RBB_BOOT_FALLBACK_PASS arch={}", std::env::consts::ARCH);
             io::stdout().flush()?;
             applet("ctl", &["poweroff"])?;
